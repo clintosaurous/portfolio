@@ -1,0 +1,105 @@
+---
+# Synchronize Files To and From Server Hosts
+#
+# Version: 2.0.2
+# Last Updated: 2023-05-09
+
+
+# Update Ansible inventory file on remote Ansible hosts.
+- import_playbook: remote-inventory.yaml
+
+
+# Synchronize the personal scripts directory to remote Ansible hosts.
+- name: Clintosaurous Synchronizations
+  hosts: "!desktop:ansiblehost"
+  gather_facts: false
+  become: true
+
+  tasks:
+    - name: Synchronize Clintosaurous Home
+      synchronize:
+        src: "/opt/clintosaurous/{{ item }}"
+        dest: /opt/clintosaurous/
+        compress: false
+        delete: true
+        rsync_opts:
+          - "--exclude=lost+found"
+      loop:
+        - ddi
+        - home
+
+
+# Synchronize audio/video media files to remote media hosts.
+- name: Media Synchronizations
+  hosts: mediahost
+  gather_facts: false
+  become: true
+
+  tasks:
+    - name: Media Files Sync
+      synchronize:
+        src: "/data/media"
+        dest: "/data/"
+        archive: false
+        compress: false
+        delete: true
+        recursive: true
+        times: true
+        rsync_opts:
+          - "--exclude=lost+found"
+
+
+# Synchronize downloaded software files to remote storage hosts.
+- name: Software Synchronizations
+  hosts: softwarehost
+  gather_facts: false
+  become: true
+
+  tasks:
+    - name: Software Files Sync
+      synchronize:
+        src: "/data/software"
+        dest: "/data/"
+        compress: false
+        delete: true
+        rsync_opts:
+          - "--exclude=lost+found"
+
+
+# Synchronize backups taken by remote management hosts to the local host for
+# backup in the cloud.
+- name: Backup Synchronizations
+  hosts: "!desktop:bkuphost"
+  gather_facts: false
+  become: true
+
+  tasks:
+    - name: Synchronize Remote Backups
+      synchronize:
+        mode: pull
+        src: "/backup/*"
+        dest: "/backup/"
+        archive: false
+        compress: false
+        delete: true
+        recursive: true
+        times: true
+        rsync_opts:
+          - "--exclude=lost+found"
+
+
+# Ensure directory and file ownership and permissions are set properly.
+- name: Reset Local Backup Directory Permissions
+  hosts: localhost
+  gather_facts: false
+  become: true
+
+  tasks:
+    - name: Reset Local Backup Directory Permissions
+      file:
+        path: /backup
+        state: directory
+        owner: mgmt-svc
+        group: mgmt
+        mode: g+rw,o=
+        recurse: true

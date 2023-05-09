@@ -1,0 +1,20 @@
+---
+# Final Provisioning of A New Ubuntu 20.04 or 22.04 Server
+#
+# Version: 1.0.0
+# Last Updated: 2023-05-01
+
+- name: Post Installation
+  hosts: "desktop:ubuntuhost"
+  gather_facts: false
+  become: true
+
+  tasks:
+    - name: Run apt autoremove
+      apt:
+        autoremove: true
+
+    - name: Remove Temporary sudo Priviles
+      file:
+        path: /etc/sudoers.d/99-tmp-install
+        state: absent

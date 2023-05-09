@@ -1,0 +1,803 @@
+#!/opt/clintosaurous/venv/bin/python3 -Bu
+
+"""
+Queries the syslog database and reports on the messages of the prior day, or
+the date specified.
+"""
+
+
+import clintosaurous.credentials
+import clintosaurous.datetime
+import clintosaurous.db
+import clintosaurous.log as log
+import clintosaurous.opts
+import json
+import os
+import pymysql
+import re
+import socket
+import time
+
+
+VERSION = '4.1.3'
+LAST_UPDATE = '2022-11-28'
+
+
+def cli_opts() -> clintosaurous.opts.argparse.Namespace:
+
+    """
+    Define CLI options.
+    """
+
+    clintosaurous.opts.parser.description = """
+        Queries the syslog database and reports on the messages of the prior
+        day, or the date specified.
+    """
+
+    clintosaurous.opts.parser.add_argument(
+        '-D', '--date',
+        help="""
+            Date to generate report data for. For reports that are not date
+            specific, a summary with the latest date will be used.
+            Default: Previous day.
+        """,
+        type=str,
+        default=clintosaurous.datetime.datestamp(time.time() - 86400)
+    )
+
+    return clintosaurous.opts.cli()
+
+# End: cli_opts()
+
+
+def db_cleanup(db: clintosaurous.db.connect):
+
+    """
+    Delete aged out report data from the database.
+    """
+
+    age_out = 30
+    tables = [
+        'syslog_host_priority_summary',
+        'syslog_host_process_summary',
+        'syslog_host_total_messages',
+        'syslog_priority_summary',
+        'syslog_process_summary'
+    ]
+
+    for table in tables:
+        log.log(
+            f'Deleting report data older than {age_out} ' +
+            f'days from table {table}'
+        )
+        sql = f'delete from {table} where datediff(curdate(), datestamp) > %s'
+        log.dbg(f'db_cleanup(): sql: {sql}')
+        log.dbg(f'db_cleanup(): age: {age_out}')
+        cursor = db.cursor()
+        row_cnt = cursor.execute(sql, [age_out])
+        cursor.close()
+        log.log(f'{row_cnt:,} rows deleted')
+
+
+def db_update(db: clintosaurous.db.connect, reports: list):
+
+    """
+    Update the report database tables.
+    """
+
+    log.log('Updating report data in reports database')
+
+    for report in reports:
+        table = report[0]
+        columns = report[1]
+        rows = report[2]
+
+        log.log(
+            f'Deleting existing data for report date in {table}'
+        )
+
+        if columns[0] == 'datestamp':
+            sql = f'delete from {table} where datestamp = %s'
+            sql_params = [opts.date]
+
+        else:
+            sql = f'delete from {table} where timestamp between %s and %s'
+            sql_params = [start_time, end_time]
+
+        log.dbg(f'db_update(): sql: {sql}')
+        log.dbg(f'db_update(): sql_params: {sql_params}')
+        row_cnt = db.cursor().execute(sql, sql_params)
+        db.commit()
+        log.log("{} rows deleted.".format(row_cnt))
+
+        values = []
+        for i in range(len(columns)):
+            values.append('%s')
+
+        log.log("Inserting report data into {}".format(table))
+        sql = (
+            f'insert into {table}\n' +
+            '    (' + ', '.join(columns) + ')\n' +
+            'values (' + ', '.join(values) + ')'
+        )
+        log.dbg(f'db_update(): sql:\n{sql}')
+        row_cnt = db.cursor().executemany(sql, rows)
+        db.commit()
+        log.log("{} rows inserted.".format(row_cnt))
+
+# End: db_update()
+
+
+def find_hostname(ip: str) -> str:
+
+    """
+    Lookup the DNS hostname for given IP address.
+    """
+
+    log.dbg(f'find_hostname(): ip: {ip}')
+
+    try:
+        return known_hosts[ip]
+
+    except KeyError:
+        log.dbg(f'find_hostname(): DNS lookup: {ip}')
+        try:
+            dns_name = socket.gethostbyaddr(ip)
+        except socket.herror:
+            known_hosts[ip] = None
+        else:
+            known_hosts[ip] = dns_name[0]
+
+    log.dbg(f'find_hostname(): known_hosts[ip]: {known_hosts[ip]}')
+    return known_hosts[ip]
+
+# End: find_hostname()
+
+
+def host_priority_summary(db: clintosaurous.db.connect) -> list:
+
+    """
+    Query the count of messages per host and per priority.
+    """
+
+    log.log('Querying host priority summary')
+
+    sql = """
+        select
+            %s as datestamp,
+            dev.hostname,
+            sl.priority,
+            count(priority) as msg_cnt
+
+        from syslog as sl
+
+        inner join (
+            select
+                case
+                    when dev1.display is null then dev1.hostname
+                    else dev1.display
+                end as hostname,
+                dev1.device_id
+            from devices as dev1
+        ) as dev
+            on dev.device_id = sl.device_id
+
+        where
+            sl.timestamp between %s and %s
+
+        group by
+            'datestamp',
+            dev.hostname,
+            sl.priority
+    """
+    log.dbg(f'host_priority_summary(): sql:\n{sql}')
+    log.dbg(f'host_priority_summary(): datestamp: {opts.date}')
+    log.dbg(f'host_priority_summary(): timestamp: {start_time}')
+    log.dbg(f'host_priority_summary(): timestamp: {end_time}')
+    cursor = db.cursor()
+    row_cnt = cursor.execute(sql, [opts.date, start_time, end_time])
+    results = cursor.fetchall()
+    cursor.close()
+    log.log(f'{row_cnt:,} rows returned')
+
+    total = 0
+    db_rows = []
+    for row in results:
+        db_rows.append(list(row))
+        total += row[3]
+
+    rpt_rows = []
+    for row in db_rows:
+        if total:
+            row.append(round(row[3] / total * 100, 2))
+        else:
+            row.append(0.0)
+        rpt_rows.append(row)
+
+    table = 'syslog_host_priority_summary'
+    columns = ['datestamp', 'host', 'priority', 'count', 'percentage']
+    return [table, columns, rpt_rows]
+
+# End: host_priority_summary()
+
+
+def host_process_summary(db: clintosaurous.db.connect) -> list:
+
+    """
+    Query the count of messages per host and per priority.
+    """
+
+    log.log('Querying host processes summary')
+
+    sql = """
+        select
+            %s as datestamp,
+            dev.hostname,
+            sl.program,
+            count(priority) as msg_cnt
+
+        from syslog as sl
+
+        inner join (
+            select
+                case
+                    when dev1.display is null then dev1.hostname
+                    else dev1.display
+                end as hostname,
+                dev1.device_id
+            from devices as dev1
+        ) as dev
+            on dev.device_id = sl.device_id
+
+        where
+            sl.timestamp between %s and %s
+
+        group by
+            'datestamp',
+            dev.hostname,
+            sl.program
+    """
+    log.dbg(f'host_process_summary(): sql:\n{sql}')
+    log.dbg(f'host_process_summary(): datestamp: {opts.date}')
+    log.dbg(f'host_process_summary(): timestamp: {start_time}')
+    log.dbg(f'host_process_summary(): timestamp: {end_time}')
+    cursor = db.cursor()
+    row_cnt = cursor.execute(sql, [opts.date, start_time, end_time])
+    results = cursor.fetchall()
+    cursor.close()
+    log.log(f'{row_cnt:,} rows returned.')
+
+    total = 0
+    db_rows = []
+    for row in results:
+        db_rows.append(list(row))
+        total += row[3]
+
+    rpt_rows = []
+    for row in db_rows:
+        if total:
+            row.append(round(row[3] / total * 100, 2))
+        else:
+            row.append(0.0)
+        rpt_rows.append(row)
+
+    table = 'syslog_host_process_summary'
+    columns = ['datestamp', 'host', 'process', 'count', 'percentage']
+    return [table, columns, rpt_rows]
+
+# End: host_process_summary()
+
+
+def host_total_msgs(db: clintosaurous.db.connect) -> list:
+
+    """
+    Query the count of messages per host.
+    """
+
+    log.log('Querying host message counts')
+
+    sql = """
+        select
+            %s as datestamp,
+            dev.hostname,
+            count(priority) as msg_cnt
+
+        from (
+            select
+                case
+                    when dev1.display is null then dev1.hostname
+                    else dev1.display
+                end as hostname,
+                dev1.device_id
+            from devices as dev1
+        ) as dev
+
+        left join syslog as sl
+            on sl.device_id = dev.device_id
+            and sl.timestamp between %s and %s
+
+        where
+            dev.hostname not in (
+                'bedroom-re1',
+                'dns',
+                'dns9.quad9.net.',
+                'ldap',
+                'living-sw1',
+                'server-gateway',
+                'spectrum-router'
+            )
+
+        group by
+            'datestamp',
+            dev.hostname
+    """
+    log.dbg(f'host_process_summary(): sql:\n{sql}')
+    log.dbg(f'host_process_summary(): datestamp: {opts.date}')
+    log.dbg(f'host_process_summary(): timestamp: {start_time}')
+    log.dbg(f'host_process_summary(): timestamp: {end_time}')
+    cursor = db.cursor()
+    row_cnt = cursor.execute(sql, [opts.date, start_time, end_time])
+    results = cursor.fetchall()
+    cursor.close()
+    log.log(f'{row_cnt:,} rows returned')
+
+    total = 0
+    db_rows = []
+    for row in results:
+        db_rows.append(list(row))
+        total += row[2]
+
+    rpt_rows = []
+    for row in db_rows:
+        if total:
+            row.append(round(row[2] / total * 100, 2))
+        else:
+            row.append(0.0)
+        rpt_rows.append(row)
+
+    table = 'syslog_host_total_messages'
+    columns = ['datestamp', 'host', 'count', 'percentage']
+    return [table, columns, rpt_rows]
+
+# End: host_total_msgs()
+
+
+def json_read(file: str):
+
+    """
+    Load JSON formatted file. This will get deleted on host reboot.
+    """
+
+    data = {}
+
+    if os.path.exists(file):
+        log.log(f'Reading JSON file {file}')
+        with open(file) as f:
+            data = json.load(f)
+            log.log(f'{len(data.keys())} rows loaded')
+
+    return data
+
+# End json_read()
+
+
+def json_write(file: str, data):
+
+    """
+    Write structure to JSON formatted file.
+    """
+
+    log.log(f'Writing {file}')
+    with open(file, 'w') as f:
+        json.dump(data, f)
+
+# End json_write()
+
+
+def login_msgs(db: clintosaurous.db.connect) -> tuple:
+
+    """
+    Queries SSH messages and parse connection information and generate SSH
+    log report.
+    """
+
+    log.log('Querying login messages')
+
+    sql = """
+        select
+            dev.hostname,
+            sl.timestamp,
+            sl.program,
+            sl.msg
+
+        from syslog as sl
+
+        inner join (
+            select
+                case
+                    when dev1.display is null then dev1.hostname
+                    else dev1.display
+                end as hostname,
+                dev1.device_id
+            from devices as dev1
+        ) as dev
+            on dev.device_id = sl.device_id
+
+        where
+            sl.timestamp between %s and %s
+            and sl.program = 'SSHD'
+    """
+    log.dbg(f'host_process_summary(): sql:\n{sql}')
+    log.dbg(f'host_process_summary(): timestamp: {start_time}')
+    log.dbg(f'host_process_summary(): timestamp: {end_time}')
+    cursor = db.cursor(pymysql.cursors.DictCursor)
+    row_cnt = cursor.execute(sql, [start_time, end_time])
+    results = cursor.fetchall()
+    cursor.close()
+    log.log(f'{row_cnt:,} rows returned.')
+
+    allowed = None
+    host = None
+    login_user = None
+    program = None
+    src_host = None
+    src_ip = None
+    timestamp = None
+    resolved_ip = {}
+    rpt_rows = []
+
+    for row in results:
+        user = None
+        ip = None
+
+        match = re.match(r'Authorized to (\S+)', row["msg"], re.I)
+        if match:
+            user = re.sub(r'[^\w\_\-]+.*$', '', match.group(1))
+            if (
+                (login_user is not None and user != login_user)
+                or (host is not None and host != row["hostname"])
+            ):
+                rpt_rows.append([
+                    timestamp,
+                    host,
+                    program,
+                    login_user,
+                    src_ip,
+                    src_host,
+                    allowed
+                ])
+                allowed = None
+                host = None
+                login_user = None
+                program = None
+                src_host = None
+                src_ip = None
+                timestamp = None
+
+            allowed = 'Allowed'
+            host = row["hostname"]
+            login_user = user
+            program = row["program"]
+            timestamp = row["timestamp"]
+
+            continue
+
+        match = re.match(
+            r'Accepted.+for\s+(\S+)\s+from\s+(\S+)', row["msg"], re.I
+        )
+        if match:
+            user = re.sub(r'[^\w\_\-]+.*$', '', match.group(1))
+            ip = match.group(2)
+            if (
+                (login_user is not None and user != login_user)
+                or (host is not None and host != row["hostname"])
+                or (src_ip is not None and src_ip != ip)
+            ):
+                rpt_rows.append([
+                    timestamp,
+                    host,
+                    program,
+                    login_user,
+                    src_ip,
+                    src_host,
+                    allowed
+                ])
+                allowed = None
+                host = None
+                login_user = None
+                program = None
+                src_host = None
+                src_ip = None
+                timestamp = None
+
+            allowed = 'Allowed'
+            host = row["hostname"]
+            login_user = user
+            program = row["program"]
+            src_ip = ip
+            src_host = find_hostname(src_ip)
+            timestamp = row["timestamp"]
+
+            continue
+
+        match = re.match(r'pam_unix.+opened.+user\s+(\S+)', row["msg"], re.I)
+        if match:
+            user = re.sub(r'[^\w\_\-]+.*$', '', match.group(1))
+            if (
+                (login_user is not None and user != login_user)
+                or (host is not None and host != row["hostname"])
+            ):
+                rpt_rows.append([
+                    timestamp,
+                    host,
+                    program,
+                    login_user,
+                    src_ip,
+                    src_host,
+                    allowed
+                ])
+                allowed = None
+                host = None
+                login_user = None
+                program = None
+                src_host = None
+                src_ip = None
+                timestamp = None
+
+            allowed = 'Allowed'
+            host = row["hostname"]
+            login_user = user
+            program = row["program"]
+            timestamp = row["timestamp"]
+
+            continue
+
+        match = re.match(
+            r'error: PAM: Authentication failure.+user (\S+) from (\S+)',
+            row["msg"], re.I
+        )
+        if match:
+            user = re.sub(r'[^\w\_\-]+.*$', '', match.group(1))
+            ip = match.group(2)
+            if (
+                (login_user is not None and user != login_user)
+                or (host is not None and host != row["hostname"])
+            ):
+                rpt_rows.append([
+                    timestamp,
+                    host,
+                    program,
+                    login_user,
+                    src_ip,
+                    src_host,
+                    allowed
+                ])
+                allowed = None
+                host = None
+                login_user = None
+                program = None
+                src_host = None
+                src_ip = None
+                timestamp = None
+
+            src_host = find_hostname(ip)
+
+            rpt_rows.append([
+                row["timestamp"],
+                row["hostname"],
+                row["program"],
+                user,
+                ip,
+                src_host,
+                'Denied'
+            ])
+            allowed = None
+            host = None
+            login_user = None
+            program = None
+            src_host = None
+            src_ip = None
+            timestamp = None
+
+            continue
+
+    if login_user is not None:
+        if src_ip is not None and src_host is None:
+            src_host = find_hostname(src_ip)
+        rpt_rows.append([
+            timestamp,
+            host,
+            program,
+            login_user,
+            src_ip,
+            src_host,
+            allowed
+        ])
+
+    table = 'sec_login_log'
+    columns = [
+        'timestamp',
+        'host',
+        'program',
+        'user',
+        'src_ip',
+        'src_dns_name',
+        'message_type'
+    ]
+    return table, columns, rpt_rows
+
+# End: login_msgs()
+
+
+def priority_summary(db: clintosaurous.db.connect) -> tuple:
+
+    """
+    Query the count of messages per priority.
+    """
+
+    log.log("Querying priority message counts")
+
+    sql = """
+        select
+            %s as datestamp,
+            sl.priority,
+            count(timestamp) as msg_cnt
+
+        from syslog as sl
+
+        where
+            sl.timestamp between %s and %s
+
+        group by
+            'datestamp',
+            sl.priority
+    """
+    log.dbg(f'host_process_summary(): sql:\n{sql}')
+    log.dbg(f'host_process_summary(): datestamp: {opts.date}')
+    log.dbg(f'host_process_summary(): timestamp: {start_time}')
+    log.dbg(f'host_process_summary(): timestamp: {end_time}')
+    cursor = db.cursor()
+    row_cnt = cursor.execute(sql, [opts.date, start_time, end_time])
+    results = cursor.fetchall()
+    cursor.close()
+    log.log(f'{row_cnt:,} rows returned')
+
+    total = 0
+    db_rows = []
+    for row in results:
+        db_rows.append(list(row))
+        total += row[2]
+
+    rpt_rows = []
+    for row in db_rows:
+        if total:
+            row.append(round(row[2] / total * 100, 2))
+        else:
+            row.append(0.0)
+        rpt_rows.append(row)
+
+    table = 'syslog_priority_summary'
+    columns = ['datestamp', 'priority', 'count', 'percentage']
+    return table, columns, rpt_rows
+
+# End: priority_summary()
+
+
+def process_summary(db: clintosaurous.db.connect) -> tuple:
+
+    log.log('Querying process message counts')
+
+    sql = """
+        select
+            %s as datestamp,
+            sl.program,
+            count(timestamp) as msg_cnt
+
+        from syslog as sl
+
+        where
+            sl.timestamp between %s and %s
+
+        group by
+            'datestamp',
+            sl.program
+    """
+    log.dbg(f'host_process_summary(): sql:\n{sql}')
+    log.dbg(f'host_process_summary(): datestamp: {opts.date}')
+    log.dbg(f'host_process_summary(): timestamp: {start_time}')
+    log.dbg(f'host_process_summary(): timestamp: {end_time}')
+    cursor = db.cursor()
+    row_cnt = cursor.execute(sql, [opts.date, start_time, end_time])
+    results = cursor.fetchall()
+    cursor.close()
+    log.log(f'{row_cnt:,} rows returned')
+
+    total = 0
+    db_rows = []
+    for row in results:
+        db_rows.append(list(row))
+        total += row[2]
+
+    rpt_rows = []
+    for row in db_rows:
+        if total:
+            row.append(round(row[2] / total * 100, 2))
+        else:
+            row.append(0.0)
+        rpt_rows.append(row)
+
+    table = 'syslog_process_summary'
+    columns = ['datestamp', 'process', 'count', 'percentage']
+    return table, columns, rpt_rows
+
+# End: process_summary()
+
+
+def total_msgs(db: clintosaurous.db.connect) -> int:
+
+    """
+    Queries the total number of messages.
+    """
+
+    log.log('Querying total messages')
+
+    sql = """
+        select count(timestamp) from syslog
+        where timestamp between %s and %s
+    """
+    log.dbg(f'host_process_summary(): sql:\n{sql}')
+    log.dbg(f'host_process_summary(): timestamp: {start_time}')
+    log.dbg(f'host_process_summary(): timestamp: {end_time}')
+    cursor = db.cursor()
+    row_cnt = cursor.execute(sql, [start_time, end_time])
+    total = cursor.fetchone()[0]
+    cursor.close()
+    log.dbg(f'{row_cnt:,} rows returned')
+
+    return total
+
+# End: total_msgs()
+
+
+if __name__ == '__main__':
+    opts = cli_opts()
+
+    log.log(f'Generating reports for {opts.date}')
+
+    known_hosts_file = '/tmp/firewall-reports.known-host.json'
+    known_hosts = json_read(known_hosts_file)
+    start_time = f'{opts.date} 00:00:00'
+    end_time = f'{opts.date} 23:59:59'
+
+    user, passwd = clintosaurous.credentials.data().get('mysql-syslog_ro')
+    db = clintosaurous.db.connect(
+        host='mysql1.clintosaurous.com',
+        user=user, passwd=passwd,
+        database='librenms'
+    )
+
+    reports = []
+    reports.append(host_priority_summary(db))
+    reports.append(host_process_summary(db))
+    reports.append(host_total_msgs(db))
+    reports.append(login_msgs(db))
+    reports.append(priority_summary(db))
+    reports.append(process_summary(db))
+    total_msgs = total_msgs(db)
+
+    db.close()
+
+    json_write(known_hosts_file, known_hosts)
+
+    user, passwd = clintosaurous.credentials.data().get('mysql-report_rw')
+    db = clintosaurous.db.connect(
+        host='mysql1.clintosaurous.com',
+        user=user, passwd=passwd,
+        database='reports'
+    )
+    db_update(db, reports)
+    db_cleanup(db)
+    db.close()
+
+    log.log('Report generations complete')
+    log.log(f'Run time: {clintosaurous.datetime.run_time()}')

@@ -1,0 +1,61 @@
+---
+# Install apt Updates
+#
+# Install `apt` updates and reboot host if updated.
+#
+# Version: 1.0.2
+# Last Updated: 2023-05-09
+
+
+- name: Upgrade apt Packages
+  hosts: desktop:ubuntuhost
+  gather_facts: false
+  become: true
+
+  tasks:
+    - name: apt update
+      apt:
+        update_cache: "yes"
+        cache_valid_time: 7200
+
+    - name: apt upgrade
+      apt:
+        upgrade: "yes"
+      register: apt_upgrade
+
+    # Sometimes packages are not upgraded for various reasons. Check if there
+    # are skipped packages.
+    - name: Check For Skipped Packages
+      set_fact:
+        skipped_packages: "{{
+          apt_upgrade.stdout |
+          regex_search('(?<=kept back:\n  ).*')
+          }}"
+
+    # Generate list of skipped packages if exist.
+    - name: List Skipped Packages
+      set_fact:
+        skipped_packages: "{{ skipped_packages.split(' ') }}"
+      when: skipped_packages
+
+    # Upgrade skipped packages by specifying them directly.
+    - name: Upgrade Skipped Packages
+      apt:
+        pkg: "{{ skipped_packages }}"
+        state: latest
+      when: skipped_packages
+
+    - name: Run apt autoremove
+      apt:
+        autoremove: true
+
+- name: Reboot Host
+  hosts: "!vboxsrv:&ubuntuhost"
+  gather_facts: false
+  become: true
+
+  tasks:
+    # Reboot the host if updates were made.
+    - name: Reboot Host
+      reboot:
+      when: apt_upgrade.changed or skipped_packages

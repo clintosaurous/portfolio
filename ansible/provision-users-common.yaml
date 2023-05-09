@@ -1,0 +1,235 @@
+---
+# Provision Common Groups and Users
+#
+# Provision common groups and users on an Ubuntu 20.04 or 22.04 server.
+#
+# Version: 2.3.0
+# Last Updated: 2023-05-09
+
+- name: Provision Users and Groups
+  hosts: "desktop:ubuntuhost"
+  gather_facts: false
+  become: true
+
+  vars:
+    home_files:
+      - .bashrc
+      - .my.cnf
+
+  tasks:
+    # Groups like `bind` are created to keep UID/GID consistent across hosts.
+    - name: Groups
+      group:
+        name: "{{ item.name }}"
+        gid: "{{ item.gid }}"
+      loop:
+        - {name: 'bind', gid: 516}
+        - {name: 'mgmt', gid: 420}
+        - {name: 'mgmt-svc', gid: 421}
+        - {name: 'mysql', gid: 604}
+        - {name: 'ssl-cert', gid: 608}
+        - {name: 'vmhost', gid: 6969}
+      loop_control:
+        label: "{{ item.name }}"
+
+    # To rsync with remote user being root, we need sudo privileges with no
+    # password. This file is removed at the end of the playbook.
+    - name: Add Temporary sudo Privileges
+      copy:
+        dest: /etc/sudoers.d/99-tmp-install
+        force: true
+        owner: root
+        group: root
+        mode: "440"
+        content: |
+          # mgmt group sudo all.
+          %mgmt     ALL=(ALL) NOPASSWD: ALL
+          mgmt-svc  ALL=(ALL) NOPASSWD: ALL
+          clint   ALL=(ALL) NOPASSWD: ALL
+
+    # Synchronize default user environment files.
+    - name: Sync /etc/skel
+      synchronize:
+        src: /etc/skel
+        dest: /etc/
+        delete: true
+
+    # DNS system user. Created to keep UID/GID consistent across hosts.
+    - name: BIND System User
+      user:
+        name: bind
+        uid: 516
+        create_home: false
+        password_lock: true
+        password: '!'
+        system: true
+        groups:
+          - ssl-cert
+        append: true
+
+    # MySQL system user. Created to keep UID/GID consistent across hosts.
+    - name: mysql System Users
+      user:
+        name: mysql
+        uid: 604
+        create_home: false
+        password_lock: true
+        password: '!'
+        system: true
+        groups:
+          - ssl-cert
+        append: true
+
+    # Add applicable groups to default user.
+    - name: User clint
+      user:
+        name: clint
+        groups:
+          - adm
+          - backup-admin
+          - mgmt
+          - ssl-cert
+        append: true
+
+    # Add SSH authorized keys to default user.
+    - name: Add clint authorized_keys
+      authorized_key:
+        user: clint
+        key: "{{ clint_ssh_key }}"
+
+    # Copy user specific environment files for default user.
+    - name: Copy Default Environment for clint
+      copy:
+        src: "/etc/skel/{{ item }}"
+        dest: "/home/clint/{{ item }}"
+        owner: clint
+        group: clint
+        mode: u=rw,g=r,o=
+        force: true
+        remote_src: true
+      loop: "{{ home_files }}"
+
+    # Copy user specific environment files for root.
+    - name: Copy Default Environment for root
+      copy:
+        src: "/etc/skel/{{ item }}"
+        dest: "/root/{{ item }}"
+        owner: root
+        group: root
+        mode: u=rw,g=r,o=
+        force: true
+        remote_src: true
+      loop: "{{ home_files }}"
+
+    # Create management user.
+    - name: User mgmt-svc
+      user:
+        name: mgmt-svc
+        password: "{{ mgmt_svc_passwd | password_hash('sha512', 'mysecretsalt') }}"
+        uid: 421
+        group: mgmt-svc
+        groups:
+          - adm
+          - backup-admin
+          - mgmt
+          - ssl-cert
+          - sudo
+        home: /home/mgmt-svc
+        shell: /bin/bash
+        append: true
+
+    # Add SSH authorized keys to management user.
+    - name: Add mgmt-svc authorized_keys
+      authorized_key:
+        user: mgmt-svc
+        key: "{{ mgmt_svc_ssh_key }}"
+
+    # Grant no password sudo privileges to management user.
+    - name: Add mgmt-svc sudo Privileges File
+      copy:
+        dest: /etc/sudoers.d/mgmt-svc
+        content: |
+          # Maintenance user sudo all.
+          mgmt-svc   ALL=(ALL) NOPASSWD: ALL
+
+    # Set ownership and file permissions for sudo file for management user.
+    - name: Set mgmt-svc sudo File Owner & Permissions
+      file:
+        path: /etc/sudoers.d/mgmt-svc
+        owner: root
+        group: root
+        mode: u=r,g=r,o=
+
+    # Create VirtualBox service account.
+    - name: User vmhost
+      user:
+        name: vmhost
+        password: "{{ vmhost_passwd | password_hash('sha512', 'mysecretsalt') }}"
+        uid: 6969
+        group: vmhost
+        home: /home/vmhost
+        shell: /bin/bash
+
+    # Grant www-data access to SSL certificates needed by web servers.
+    - name: User www-data
+      user:
+        name: www-data
+        groups:
+          - ssl-cert
+        append: true
+
+    # Add sudo privileges for management users.
+    - name: Add mgmt sudo Privileges File
+      copy:
+        dest: /etc/sudoers.d/group-mgmt
+        force: true
+        owner: root
+        group: root
+        mode: "440"
+        content: |
+          # Group permissions. Group permissions should be set before user permissiosn.
+          %mgmt     ALL=(ALL) NOPASSWD: /usr/sbin/shutdown
+          %mgmt     ALL=(ALL) NOPASSWD: /usr/sbin/reboot
+          %mgmt     ALL=(ALL) NOPASSWD: /usr/sbin/netplan apply
+          %mgmt     ALL=(ALL) NOPASSWD: /usr/sbin/netplan try
+
+          # mgmt-svc sudo all.
+          mgmt-svc  ALL=(ALL) NOPASSWD: ALL
+
+    - name: User syslog Home Directory
+      file:
+        path: /home/syslog
+        state: directory
+        owner: syslog
+        group: syslog
+        mode: o=rwx,g=,o=
+
+    # Update syslog user home directory. Home directory is needed for
+    # automated credential retrieval.
+    - name: Update User syslog home path
+      user:
+        name: syslog
+        home: /home/syslog
+
+    - name: Retrieve List of Home Directories
+      shell:
+        cmd: "cd /home && ls -1"
+      register: home_dirs
+      failed_when: "home_dirs.stderr or not home_dirs.stdout"
+
+    - name: Resetting Home Directory Owners
+      file:
+        path: "/home/{{ item }}"
+        state: directory
+        owner: "{{ item }}"
+        group: "{{ item }}"
+        recurse: true
+      loop: "{{ home_dirs.stdout_lines }}"
+      # Because of special mounts, desktops cannot perform resets like this.
+      when: "'desktop' not in group_names"
+
+    # Remove the temporary sudo no password privileges.
+    - name: Remove Temporary sudo Privileges
+      file:
+        path: /etc/sudoers.d/99-tmp-install
+        state: absent

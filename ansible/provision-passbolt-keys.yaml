@@ -1,0 +1,52 @@
+---
+# Provision Passbolt user GPG keys on an Ubuntu 20.04 or 22.04 server.
+#
+# Version: 1.0.1
+# Last Updated: 2022-12-21
+
+- name: Copy Passbolt Keys
+  hosts: ubuntuhost
+  gather_facts: false
+
+  tasks:
+    - name: Copy Passbolt Key Files
+      ansible.posix.synchronize:
+        src: /data/ca/passbolt
+        dest: /tmp/
+
+    - name: Update Permissions to Passbolt Key Files
+      file:
+        path: /tmp/passbolt
+        state: directory
+        mode: '755'
+        recurse: true
+
+- name: Setup Passbolt GPG Keys
+  hosts: ubuntuhost
+  gather_facts: false
+  become: true
+
+  tasks:
+    - name: Retrieve List of Home Directories
+      shell:
+        cmd: "cd /home && ls -1"
+      register: home_dirs
+      failed_when: "home_dirs.stderr or not home_dirs.stdout"
+
+    - name: Add Root and Clintosaurous to Home Directories
+      set_fact:
+        passbolt_users: "{{ home_dirs.stdout_lines + ['root', clintosaurous_user] }}"
+
+    - name: Import Passbolt Keys
+      shell:
+        cmd: "su -s /bin/bash -c 'gpg --batch --import /tmp/passbolt/passbolt_*{{ item }}.asc' - {{ item }}"
+        warn: false
+      register: passbolt_import
+      when: "item != 'vmhost'"
+      loop: "{{ passbolt_users }}"
+      changed_when: "'not changed' not in passbolt_import.stderr"
+
+    - name: Delete Passbolt Key Files
+      file:
+        path: "/tmp/passbolt"
+        state: absent

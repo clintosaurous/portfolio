@@ -1,0 +1,189 @@
+#!/opt/clintosaurous/venv/bin/python3 -Bu
+
+"""
+Queries the LibreNMS database for disk information for each host and outputs
+to a text table.
+"""
+
+
+import clintosaurous.credentials as credentials
+import clintosaurous.db
+import clintosaurous.text
+
+
+VERSION = '2.0.0'
+LAST_UPDATE = '2022-12-01'
+
+
+def bytedown(bytes: int) -> str:
+
+    if opts.gigabytes:
+        if bytes == 0:
+            return '0.00GB'
+        return f'{round(bytes / 1073741824, 2):,}GB'
+
+    for increment in ['B', 'KB', 'MB', 'GB', 'TB']:
+        if bytes < 1024:
+            return f'{round(bytes, 2):,}{increment}'
+        bytes /= 1024
+
+    if bytes:
+        return f'{round(bytes, 2):,}TB'
+
+
+def cli_opts() -> clintosaurous.opts.argparse.Namespace:
+
+    """
+    Define CLI options.
+    """
+
+    clintosaurous.opts.parser.description = """
+        Queries the LibreNMS database for disk information for each host and
+        outputs to a text table.
+    """
+
+    clintosaurous.opts.parser.add_argument(
+        '-g', '--gigabytes',
+        help='Break down all byte counts to gigabies.',
+        action='store_true'
+    )
+
+    clintosaurous.opts.parser.add_argument(
+        '-f', '--free',
+        help='Sort based on the amount of disk space free.',
+        action='store_true'
+    )
+
+    clintosaurous.opts.parser.add_argument(
+        '-F', '--percent-free',
+        help='Sort based on percentage of disk space free.',
+        action='store_true'
+    )
+
+    clintosaurous.opts.parser.add_argument(
+        '-u', '--used',
+        help='Sort based on the amount of disk space used.',
+        action='store_true'
+    )
+
+    clintosaurous.opts.parser.add_argument(
+        '-U', '--percent-used',
+        help='Sort based on percentage of disk space used.',
+        action='store_true'
+    )
+
+    return clintosaurous.opts.cli()
+
+
+if __name__ == '__main__':
+    opts = cli_opts()
+    user, passwd = credentials.data().get('mysql-report_ro')
+    db = clintosaurous.db.connect(
+        host='mysql1.clintosaurous.com',
+        user=user,
+        passwd=passwd,
+        database='librenms',
+        logging=False
+    )
+
+    rpt_rows = [['Host', 'Disk', 'Total', 'Free', 'Used']]
+
+    sql = """
+        select
+            case
+                when d.display is null then d.hostname
+                else d.display
+            end as host,
+            s.storage_descr,
+            s.storage_size,
+            s.storage_free,
+            100 - s.storage_perc as percent_free,
+            s.storage_used,
+            s.storage_perc as percent_used
+
+        from storage as s
+
+        inner join devices as d
+            on d.device_id = s.device_id
+
+        where
+            s.storage_descr in ('/', '/backup', '/var')
+            or s.storage_descr like '/data%'
+            or s.storage_descr like '/var/lib/%'
+            or s.storage_descr like '/var/log/%'
+    """
+    if opts.free:
+        sql += 'order by s.storage_free desc'
+    elif opts.percent_free:
+        sql += 'order by percent_free desc'
+    elif opts.used:
+        sql += 'order by s.storage_used desc'
+    elif opts.percent_used:
+        sql += 'order by percent_used desc'
+    else:
+        sql += 'order by host, s.storage_descr'
+    cursor = db.cursor()
+    cursor.execute(sql)
+    db_rows = [list(r) for r in cursor]
+
+    db_rows.append(False)
+    sql = """
+        select
+            'VM Hosts Total',
+            s.storage_descr,
+            sum(s.storage_size) as storage_size,
+            sum(s.storage_free) as storage_free,
+            100 - (sum(s.storage_used) / sum(s.storage_size) * 100)
+                as percent_free,
+            sum(s.storage_used) as storage_used,
+            100 - (sum(s.storage_free) / sum(s.storage_size) * 100)
+                as percent_used
+
+        from storage as s
+
+        inner join devices as d
+            on d.device_id = s.device_id
+
+        where
+            d.display in ('blue', 'silver')
+            and s.storage_descr in ('/', '/data')
+
+        group by
+            s.storage_descr
+
+        order by
+            s.storage_descr
+    """
+    cursor.execute(sql)
+    db_rows += [list(r) for r in cursor]
+    cursor.close()
+
+    if opts.gigabytes:
+        rjust = 10
+    else:
+        rjust = 8
+
+    last_host = False
+    for row in db_rows:
+        if not row:
+            rpt_rows.append(False)
+            continue
+
+        if last_host == row[0]:
+            row[0] = ''
+        else:
+            last_host = row[0]
+        row[2] = bytedown(row[2])
+        row[3] = bytedown(row[3])
+        row[5] = bytedown(row[5])
+        percent_free = '(' + str(round(row[4])) + '%)'
+        percent_used = '(' + str(round(row[6])) + '%)'
+        rpt_rows.append([
+            row[0],
+            row[1],
+            row[2].rjust(rjust),
+            f'{row[3].rjust(rjust)} {percent_free.rjust(6)}',
+            f'{row[5].rjust(rjust)} {percent_used.rjust(6)}'
+        ])
+
+    print(clintosaurous.text.table(rpt_rows))

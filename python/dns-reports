@@ -1,0 +1,588 @@
+#!/opt/clintosaurous/venv/bin/python3 -Bu
+
+"""
+Queries the syslog database for DNS queries for the previous day and generates
+some reports and stores them in the reports database.
+"""
+
+
+import clintosaurous.datetime
+import clintosaurous.ddi
+import clintosaurous.log as log
+import clintosaurous.opts
+import re
+import time
+
+
+VERSION = '4.2.7'
+LAST_UPDATE = '2022-12-10'
+
+
+def cli_opts() -> clintosaurous.opts.argparse.Namespace:
+
+    """
+    Define CLI options.
+    """
+
+    clintosaurous.opts.parser.description = """
+        Queries the syslog database for DNS queries for the previous day and
+        generates some reports and stores them in the reports database.
+    """
+
+    clintosaurous.opts.parser.add_argument(
+        '-D', '--date',
+        help="""
+            Date to generate report data for. For reports that are not date
+            specific, a summary with the latest date will be used.
+            Default: Previous day.
+        """,
+        type=str,
+        default=clintosaurous.datetime.datestamp(time.time() - 86400)
+    )
+
+    return clintosaurous.opts.cli()
+
+
+def db_cleanup() -> None:
+
+    """
+    Delete aged out report data from the database.
+    """
+
+    age_out = 30
+    tables = [
+        "dns_ad_malware_hosts",
+        "dns_ad_malware_queries",
+        "dns_clint_home_query_hosts",
+        "dns_queries_per_client",
+        "dns_queries_per_server",
+        "dns_top_name_queries",
+        "dns_top_queried_domains"
+    ]
+
+    cursor = db.cursor()
+
+    for table in tables:
+        log.log(
+            f'Deleting report data older than {age_out} ' +
+            f'days from table {table}'
+        )
+
+        sql = f"""
+            delete from reports.{table}
+            where datediff(curdate(), datestamp) > %s
+        """
+        log.dbg(f'db_cleanup(): sql:\n{sql}')
+        log.dbg(f'db_cleanup(): age out: {age_out}')
+        row_cnt = cursor.execute(sql, [age_out])
+        db.commit()
+        log.log(f'{row_cnt:,} rows deleted.')
+
+    cursor.close()
+
+
+def db_update(reports: list) -> None:
+
+    """
+    Update the report database tables.
+    """
+
+    log.log('Updating report data in reports database')
+
+    for report in reports:
+        table = report[0]
+        columns = report[1]
+        rows = report[2]
+
+        log.log(f'Deleting existing data for report date in {table}')
+        sql = f"delete from reports.{table} where datestamp = '{opts.date}'"
+        log.dbg(f'db_update(): sql: {sql}')
+        row_cnt = db.cursor().execute(sql)
+        db.commit()
+        log.log(f'{row_cnt} rows deleted.')
+
+        log.log(f'Inserting report data into {table}')
+
+        values = ['%s' for i in range(len(columns))]
+        col_list = ", ".join(columns)
+        values = ", ".join(values)
+        sql = f"insert into reports.{table} ({col_list}) values ({values})"
+        log.dbg(f'db_update(): sql: {sql}')
+        row_cnt = db.cursor().executemany(sql, rows)
+        db.commit()
+        log.log(f'{row_cnt} rows inserted.')
+
+
+def dns_adblock_counts() -> tuple[list[list], list[list]]:
+
+    """
+    Query block/malware zones.
+    """
+
+    log.log("Querying blocked zones")
+    sql = \
+        "select distinct zone, block_type from clintosaurous.ddi_block_zones"
+    log.dbg(f'dns_adblock_counts(): sql: {sql}')
+    cursor = db.cursor()
+    row_cnt = cursor.execute(sql)
+    block_zones = {}
+    for row in cursor:
+        block_zones[row[0]] = row[1].title()
+    cursor.close()
+    log.log(f'{row_cnt:,} rows returned.')
+
+    log.log("Querying ad/malware requests")
+    sql = """
+        select client_ip, lower(dns_request) as dns_request, server_name
+        from ddi_dns_query_log
+        where
+            query_timestamp between %s and %s
+            and dns_request like '%%.%%'
+            and dns_request not like '%%.clintosaurous.com.'
+            and dns_request not like '%%.168.192.in-addr.arpa.'
+            and dns_request not like '%%.0.0.c.f.arpa.'
+            and dns_request not like '%%.lab'
+    """
+    log.dbg(f'dns_adblock_counts(): sql:\n{sql}')
+    log.dbg(f'dns_adblock_counts(): query_timestamp: {start_time}')
+    log.dbg(f'dns_adblock_counts(): query_timestamp: {end_time}')
+
+    counts = {"hosts": {}, "zones": {}}
+    row_cnt = 0
+    zone_total = 0
+
+    for d in [db, db_dev]:
+        cursor = d.cursor()
+        row_cnt += cursor.execute(sql, [start_time, end_time])
+
+        for db_request in cursor:
+            request = list(db_request)
+            server_name = request.pop()
+            if re.match(r'127\.0\.', request[0]):
+                client = server_name
+            else:
+                if request[0] in clint_hosts:
+                    client = clint_hosts[request[0]]
+                else:
+                    client = request[0]
+
+            dns_request = request[1]
+
+            while re.search(r'\.', dns_request):
+                if dns_request not in block_zones:
+                    dns_request = re.sub(r'^[^\.]*\.', '', dns_request)
+                    continue
+
+                zone_total += 1
+
+                if client in counts["hosts"]:
+                    counts["hosts"][client] += 1
+                else:
+                    counts["hosts"][client] = 1
+
+                if dns_request in counts["zones"]:
+                    counts["zones"][dns_request] += 1
+                else:
+                    counts["zones"][dns_request] = 1
+
+                break
+
+        cursor.close()
+
+    log.log(f'{row_cnt:,} rows returned.')
+
+    zone_rows = []
+    zone_counts = counts["zones"]
+    for zone in zone_counts.keys():
+        percent = round(zone_counts[zone] / zone_total * 100, 2)
+        zone_rows.append([
+            opts.date,
+            zone,
+            block_zones[zone].title(),
+            zone_counts[zone],
+            percent
+        ])
+
+    zone_table = 'dns_ad_malware_queries'
+    zone_columns = ["datestamp", "zone", "zone_type", "count", "percentage"]
+
+    host_rows = []
+    host_counts = counts["hosts"]
+    for host in host_counts.keys():
+        host_rows.append([opts.date, host, host_counts[host]])
+
+    host_total = 0
+    for row in host_rows:
+        host_total += row[2]
+
+    for row in host_rows:
+        row.append(round(row[2] / host_total * 100, 2))
+
+    host_table = 'dns_ad_malware_hosts'
+    host_columns = ["datestamp", "client", "count", "percentage"]
+
+    rpt1 = [host_table, host_columns, host_rows]
+    rpt2 = [zone_table, zone_columns, zone_rows]
+    return rpt1, rpt2
+
+
+def dns_client_query_cnt() -> list[str, list, list]:
+
+    """
+    Array reference of array references of the actual report data. Each sub
+    array is a row of data.
+    """
+
+    log.log("Querying DNS client query counts")
+    sql = """
+        select
+            ql.client_ip,
+            count(ql.client_ip) as 'query_count',
+            ql.server_name
+        from ddi_dns_query_log as ql
+        where query_timestamp between %s and %s
+        group by client_ip, ql.server_name
+    """
+    log.dbg(f'dns_client_query_cnt(): sql:\n{sql}')
+    log.dbg(f'dns_client_query_cnt(): query_timestamp: {start_time}')
+    log.dbg(f'dns_client_query_cnt(): query_timestamp: {end_time}')
+
+    total = 0
+    row_cnt = 0
+    clients = {}
+
+    for d in [db, db_dev]:
+        cursor = d.cursor()
+        row_cnt += cursor.execute(sql, [start_time, end_time])
+
+        for row in cursor:
+            row = list(row)
+            server_name = row.pop()
+
+            if re.match(r'127\.0\.', row[0]):
+                row[0] = server_name
+            else:
+                if row[0] in clint_hosts:
+                    row[0] = clint_hosts[row[0]]
+
+            try:
+                clients[row[0]] += row[1]
+            except KeyError:
+                clients[row[0]] = row[1]
+
+            total += row[1]
+
+        cursor.close()
+
+    rpt_rows = []
+    for client in clients.keys():
+        rpt_rows.append([
+            opts.date,
+            client,
+            clients[client],
+            round(clients[client] / total * 100, 2)
+        ])
+
+    log.log(f'{row_cnt:,} rows returned.')
+
+    table = 'dns_queries_per_client'
+    columns = ["datestamp", "client", "count", "percentage"]
+    return [table, columns, rpt_rows]
+
+
+def dns_clint_hosts() -> dict:
+
+    """
+    Query Clint's host from A records in the DNS database.
+    """
+
+    log.log('Querying a records in the DDI database')
+    clint_hosts = {}
+    for d in [ddi, ddi_dev]:
+        for record in d.dns.records.get(record_type='A', metadata=False):
+            if re.match(r'loghost|ntp', record["dns_request"]):
+                continue
+            host = re.sub(
+                r'\.clintosaurous\.com\.?$', '', record["dns_request"])
+            clint_hosts[record["dns_response"]] = host
+
+    log.log(f'{len(clint_hosts.keys())} hosts retrieved from DNS')
+
+    return clint_hosts
+
+
+def dns_clint_query_cnt() -> list[str, list, list]:
+
+    """
+    Queries the IPAM database for DNS queries to clintosaurous.com and returns
+    the number of DNS requests.
+    """
+
+    log.log("Querying clintosaurous.com request counts")
+    sql = """
+        select
+            lower(dns_request),
+            count(dns_request) as 'query_count'
+        from ddi_dns_query_log
+        where
+            query_timestamp between %s and %s
+            and (
+                dns_request like '%%.clintosaurous.com'
+                or dns_request like '%%.lab'
+                or dns_request not like '%%.%%'
+            )
+        group by
+            dns_request
+    """
+    log.dbg(f'dns_clint_query_cnt(): sql:\n{sql}')
+    log.dbg(f'dns_clint_query_cnt(): query_timestamp: {start_time}')
+    log.dbg(f'dns_clint_query_cnt(): query_timestamp: {end_time}')
+
+    row_cnt = 0
+    rpt_rows = []
+    total = 0
+
+    dns_requests = {}
+    for d in [db, db_dev]:
+        cursor = d.cursor()
+        row_cnt += cursor.execute(sql, [start_time, end_time])
+        for row in cursor:
+            total += row[1]
+
+            try:
+                dns_requests[row[0]] += 1
+            except KeyError:
+                dns_requests[row[0]] = 1
+
+        cursor.close()
+
+    log.log(f'{row_cnt:,} rows returned.')
+
+    for dns_request in dns_requests.keys():
+        count = dns_requests[dns_request]
+        rpt_rows.append([
+            opts.date, dns_request, count, round(row[1] / total * 100, 2)
+        ])
+
+    table = 'dns_clint_home_query_hosts'
+    columns = ["datestamp", "dns_name", "count", "percentage"]
+    return [table, columns, rpt_rows]
+
+
+def dns_srv_query_cnt() -> list[str, list, list]:
+
+    """
+    Queries the IPAM database for DNS queries and returns the number of
+    queries per DNS server for the given date.
+    """
+
+    log.log("Querying queries by server")
+    sql = """
+        select
+            server_name,
+            count(server_name) as 'query_count'
+        from ddi_dns_query_log
+        where query_timestamp between %s and %s
+        group by server_name
+    """
+    log.dbg(f'dns_srv_query_cnt(): sql:\n{sql}')
+    log.dbg(f'dns_srv_query_cnt(): datestamp: {opts.date}')
+    log.dbg(f'dns_srv_query_cnt(): query_timestamp: {start_time}')
+    log.dbg(f'dns_srv_query_cnt(): query_timestamp: {end_time}')
+
+    total = 0
+    servers = {}
+    for d in [db, db_dev]:
+        cursor = d.cursor()
+        row_cnt = cursor.execute(sql, [start_time, end_time])
+        log.log(f'{row_cnt:,} rows returned.')
+
+        for row in cursor:
+            total += row[1]
+            try:
+                servers[row[0]] += row[1]
+            except KeyError:
+                servers[row[0]] = row[1]
+
+        cursor.close()
+
+    rpt_rows = []
+    for server_name in servers.keys():
+        rpt_rows.append([
+            opts.date,
+            server_name,
+            servers[server_name],
+            round(row[1] / total * 100, 2)
+        ])
+
+    table = 'dns_queries_per_server'
+    columns = ["datestamp", "host", "count", "percentage"]
+    return [table, columns, rpt_rows]
+
+
+def dns_top_domain_cnt() -> list[str, list, list]:
+
+    """
+    Queries the IPAM database for DNS queries and returns the top domain
+    names queried by clients.
+    """
+
+    log.log("Querying top domains requests")
+    sql = """
+        select dns_request from ddi_dns_query_log
+        where query_timestamp between %s and %s
+    """
+    log.dbg(f'dns_top_domain_cnt(): sql:\n{sql}')
+    log.dbg(f'dns_top_domain_cnt(): query_timestamp: {start_time}')
+    log.dbg(f'dns_top_domain_cnt(): query_timestamp: {end_time}')
+
+    total = 0
+    counts = {}
+    for d in [db, db_dev]:
+        cursor = d.cursor()
+        row_cnt = cursor.execute(sql, [start_time, end_time])
+        log.log(f'{row_cnt:,} rows returned.')
+        for row in cursor:
+            if re.search(r'\.arpa\.?$', row[0]):
+                domain = re.sub(
+                    r'^.+\.(\d+\.\d+\.[^\.]+\.[^\.]+)\.?$', r'\1', row[0])
+            elif re.match(r'[^\.]+\.[^\.]+\.?$', row[0]):
+                domain = row[0]
+            else:
+                domain = re.sub(r'^.+\.([^\.]+\.[^\.]+)\.?$', r'\1', row[0])
+            domain = re.sub(r'^\.', '', domain)
+
+            try:
+                counts[domain] += 1
+            except KeyError:
+                counts[domain] = 1
+            total += 1
+
+        cursor.close()
+
+    rpt_rows = []
+    for domain in counts.keys():
+        rpt_rows.append([opts.date, domain, counts[domain]])
+
+    rpt_rows = sorted(rpt_rows, key=lambda r: r[2])
+    rpt_rows.reverse()
+    if len(rpt_rows) > 50:
+        rpt_rows = rpt_rows[0:50]
+
+    for row in rpt_rows:
+        row.append(round(row[2] / total * 100, 2))
+
+    table = 'dns_top_queried_domains'
+    columns = ["datestamp", "domain", "count", "percentage"]
+    return [table, columns, rpt_rows]
+
+
+def dns_top_query_cnt() -> list[str, list, list]:
+
+    """
+    Queries the IPAM database for DNS queries and returns the top names
+    queried by clients.
+    """
+
+    log.log("Querying top client requests")
+    sql = """
+        select
+            lower(dns_request),
+            count(dns_request) as 'query_count'
+        from ddi_dns_query_log
+        where query_timestamp between %s and %s
+        group by dns_request
+    """
+    log.dbg(f'dns_top_query_cnt(): sql:\n{sql}')
+    log.dbg(f'dns_top_query_cnt(): query_timestamp: {start_time}')
+    log.dbg(f'dns_top_query_cnt(): query_timestamp: {end_time}')
+
+    counts = {}
+    total = 0
+    for d in [db, db_dev]:
+        row_cnt = 0
+        cursor = d.cursor()
+        row_cnt += cursor.execute(sql, [start_time, end_time])
+        log.log(f'{row_cnt:,} rows returned.')
+        for row in cursor:
+            total += row[1]
+            if row[0] in counts:
+                counts[row[0]] += row[1]
+            else:
+                counts[row[0]] = row[1]
+        cursor.close()
+
+    rpt_rows = []
+    for req in sorted(counts.keys()):
+        percent = round(counts[req] / total * 100, 2)
+        rpt_rows.append([opts.date, req, counts[req], percent])
+
+    rpt_rows = sorted(rpt_rows, key=lambda r: r[2])
+    rpt_rows.reverse()
+    if len(rpt_rows) > 50:
+        rpt_rows = rpt_rows[0:50]
+
+    table = 'dns_top_name_queries'
+    columns = ["datestamp", "dns_name", "count", "percentage"]
+    return [table, columns, rpt_rows]
+
+
+def total_queries() -> int:
+
+    log.log("Querying total requests")
+
+    total_queries = 0
+    for d in [db, db_dev]:
+        sql = """
+            select count(dns_request)
+            from ddi_dns_query_log
+            where query_timestamp between %s and %s
+        """
+        log.dbg(f'total_queries(): sql:\n{sql}')
+        log.dbg(f'total_queries(): query_timestamp: {start_time}')
+        log.dbg(f'total_queries(): query_timestamp: {end_time}')
+        cursor = d.cursor()
+        cursor.execute(sql, [start_time, end_time])
+        total_queries += cursor.fetchone()[0]
+        cursor.close()
+
+    log.log(f'{total_queries:,} total queries')
+    return total_queries
+
+
+if __name__ == '__main__':
+    opts = cli_opts()
+    start_time = f'{opts.date} 00:00:00'
+    end_time = f'{opts.date} 23:59:59'
+
+    log.log(f'Generating reports for {opts.date}')
+
+    ddi = clintosaurous.ddi.connect(logging=True)
+    ddi_dev = clintosaurous.ddi.connect(
+        db_name='clintosaurous_dev',
+        logging=True
+    )
+    db = ddi.db.connection
+    db_dev = ddi_dev.db.connection
+
+    clint_hosts = dns_clint_hosts()
+
+    reports = []
+    reports.append(dns_srv_query_cnt())
+    reports.append(dns_client_query_cnt())
+    reports.append(dns_top_query_cnt())
+    reports.append(dns_top_domain_cnt())
+    reports.append(dns_clint_query_cnt())
+    rpt1, rpt2 = dns_adblock_counts()
+    reports.append(rpt1)
+    reports.append(rpt2)
+    total_queries = total_queries()
+
+    db_update(reports)
+    db_cleanup()
+
+    ddi.close()
+    ddi_dev.close()
+
+    log.log("Report generations complete.")
+    log.log("Run time: " + clintosaurous.datetime.run_time())

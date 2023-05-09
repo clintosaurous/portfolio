@@ -1,0 +1,217 @@
+#!/opt/clintosaurous/venv/bin/python3 -Bu
+
+"""
+Continuously ping given address and report back.
+
+This script will continuously ping the device supplied and keep track of
+ping responses.
+
+    ping-monitor -t <sec> -l <sec> <hostname|ip>
+"""
+
+
+import clintosaurous.log as log
+import clintosaurous.opts
+import ipaddress
+import dns.resolver as pyresolv
+import re
+from signal import signal, SIGINT
+import subprocess
+import sys
+import time
+
+
+VERSION = '4.1.0'
+LAST_UPDATE = '2023-05-08'
+
+
+def cli_opts() -> clintosaurous.opts.argparse.Namespace:
+
+    """
+    Define CLI options.
+    """
+
+    clintosaurous.opts.parser.add_argument(
+        '-l', '--interval',
+        type=int,
+        default=1,
+        help='Interval in seconds between ping attempts. Default: 1 second'
+    )
+
+    clintosaurous.opts.parser.add_argument(
+        '-t', '--timeout',
+        type=int,
+        default=1,
+        help='Timeout in seconds between ping attempts. Default: 1 second'
+    )
+
+    return clintosaurous.opts.cli(True)
+
+# End CLI options
+
+
+def exit_summary(sig_recv, frame):
+
+    """
+    Output stats summary on exit.
+    """
+
+    resp_cnt = str(stats["resp_cnt"]).rjust(5)
+    resp_per = round((stats["resp_cnt"] / stats["count"]) * 100, 2)
+    drop_cnt = str(stats["drop_cnt"]).rjust(5)
+    drop_per = round(100 - resp_per, 2)
+    max_drop = str(stats["max_drop_cnt"]).rjust(5)
+    min_resp = str(round(stats["min_time"], 2)).rjust(5)
+    avg_resp = str(round(stats["avg_time"], 2)).rjust(5)
+    max_resp = str(round(stats["max_time"])).rjust(5)
+    max_drop_per = \
+        str(round(stats["max_drop_time"] / stats["count"] * 100, 2))
+
+    print(f"""
+
+-------------------------------------------------------------------
+Options Summary:
+    Device: {disp_name}
+    Ping Timeout: {opts.timeout} sec.
+    Ping Delay:   {opts.interval} sec.
+
+Counter Statistics:
+    Total Requests:          {str(stats["count"]).rjust(5)}
+    Total Replies:           {resp_cnt} ({resp_per}%)
+    Total Drops:             {drop_cnt} ({drop_per}%)
+    Multiple Drop Instances: {str(stats["multi_drop_cnt"]).rjust(5)}
+    Max Drop Instance Count: {max_drop} ({max_drop_per}%)
+    Min. Response Time:      {min_resp} ms
+    Avg. Response Time:      {avg_resp} ms
+    Max Response Time:       {max_resp} ms
+-------------------------------------------------------------------
+""")
+    sys.exit(0)
+
+# End: exit_summary()
+
+
+if __name__ == '__main__':
+    opts, args = cli_opts()
+    device = args[0]
+
+    stats = {
+        "count": 0,
+        "drop_cnt": 0,
+        "max_drop_cnt": 0,
+        "max_drop_time": 0,
+        "multi_drop_cnt": 0,
+        "resp_cnt": 0,
+        "min_time": 0,
+        "max_time": 0,
+        "total_time": 0,
+        "avg_time": 0
+    }
+    cur_drop = 0
+    drop_start = 0
+    state = ''
+
+    # Lookup PTR record for IP address.
+    try:
+        ip_addr = ipaddress.ip_address(device)
+        arpa = ip_addr.reverse_pointer
+        ip = str(ip_addr)
+        try:
+            hostname = [
+                re.sub(r'\.+$', '', str(r))
+                for r in pyresolv.resolve(arpa, 'PTR')
+            ][0]
+        except (
+            pyresolv.LifetimeTimeout,
+            pyresolv.NoNameservers,
+            pyresolv.NXDOMAIN,
+            IndexError
+        ):
+            hostname = ip
+
+    # Lookup non-PTR records.
+    except ValueError:
+        hostname = device
+        if '.' not in device:
+            device += '.clintosaurous.com'
+        ip = [str(r) for r in pyresolv.resolve(device)][0]
+
+    if ip != hostname:
+        disp_name = f'{hostname} ({ip})'
+    else:
+        disp_name = ip
+
+    print(
+        f'Device:     {disp_name}\n' +
+        f'Timeout:    {opts.timeout}\n' +
+        f'Interval:   {opts.interval}\n'
+    )
+
+    signal(SIGINT, exit_summary)
+
+    seq_reg = re.compile(r'icmp_seq=(\d+)')
+    time_reg = re.compile(r'\d+ bytes from.+time=(\S+)')
+
+    cmd = f'ping -n -O -W {opts.timeout} -i {opts.interval} {ip}'
+    ping = subprocess.Popen(
+        cmd.split(), stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    ping_out = ping.stdout
+
+    while ping.poll() is None:
+        line = ping_out.readline().decode().strip()
+        match = seq_reg.search(line)
+        if not match:
+            continue
+
+        stats["count"] += 1
+
+        match = time_reg.search(line)
+        if match:
+            resp_time = float(match.group(1))
+            stats["resp_cnt"] += 1
+            stats["total_time"] += resp_time
+            stats["avg_time"] = stats["total_time"] / stats["resp_cnt"]
+
+            if not stats["min_time"] or resp_time < stats["min_time"]:
+                stats["min_time"] = resp_time
+            if resp_time > stats["max_time"]:
+                stats["max_time"] = resp_time
+
+            if state != 'up':
+                state = 'up'
+                msg = f'{disp_name} responded (Try: {stats["count"]})'
+                print(end='\r')
+                log.log(f'{msg.ljust(78)}')
+
+                if cur_drop > stats["max_drop_cnt"]:
+                    stats["max_drop_cnt"] = cur_drop
+                    stats["max_drop_time"] = time.time() - drop_start
+                    cur_drop = 0
+                    drop_start = 0
+
+        else:
+            stats["drop_cnt"] += 1
+            resp_time = 0
+            cur_drop += 1
+            if cur_drop == 2:
+                stats["multi_drop_cnt"] += 1
+
+            if state != 'down':
+                state = 'down'
+                msg = f'{disp_name} did not respond (Try: {stats["count"]})'
+                print(end='\r')
+                log.log(f'{msg.ljust(78)}')
+                drop_start = time.time()
+
+        resp_per = round(stats["resp_cnt"] / stats["count"] * 100, 2)
+        resp_disp = str(round(resp_time, 3)).rjust(7)
+        min_disp = str(round(stats["min_time"], 2)).rjust(6)
+        avg_disp = str(round(stats["avg_time"], 2)).rjust(6)
+        max_disp = str(round(stats["max_time"], 2)).rjust(6)
+        print(
+            '\r' +
+            f'Drops/Pings: {stats["drop_cnt"]}/{stats["count"]} ' +
+            f'({resp_per}%) Last/Min/Avg/Max: ' +
+            f'{resp_disp}/{min_disp}/{avg_disp}/{max_disp} ms',
+            end=''
+        )

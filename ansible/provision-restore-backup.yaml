@@ -1,0 +1,301 @@
+---
+# Restore backed up files on an Ubuntu 20.04 or 22.04 server.
+#
+# Version: 1.1.2
+# Last Updated: 2023-01-13
+
+- name: Create Backup Directory
+  hosts: ubuntuhost
+  gather_facts: false
+  become: true
+
+  tasks:
+    - name: Create /backup Directory
+      file:
+        path: /backup
+        owner: clint
+        group: backup-admin
+        mode: o=rwx,g=rswx,o=
+        state: directory
+
+- name: Mount Backup Volume
+  hosts: ubuntuhost
+  gather_facts: false
+  become: true
+
+  vars:
+    device_path: false
+
+  tasks:
+    - name: Check For data-backup LVM
+      stat:
+        path: "/dev/mapper/data-backup"
+      register: data_backup_lvm
+
+    - name: Check For data-vg-backup LVM
+      stat:
+        path: "/dev/mapper/data-vg-backup"
+      register: data_vg_backup_lvm
+
+    - name: /dev/mapper/data-backup Mount In fstab
+      lineinfile:
+        path: /etc/fstab
+        line: "/dev/mapper/data-backup /backup ext4 defaults 0 1"
+        backup: true
+        insertafter: EOF
+      when: "data_backup_lvm.stat.exists"
+
+    - name: /dev/mapper/data_vg_backup Mount In fstab
+      lineinfile:
+        path: /etc/fstab
+        line: /dev/mapper/data-vg-backup /backup ext4 defaults 0 1
+        backup: true
+        insertafter: EOF
+      when: "data_vg_backup_lvm.stat.exists"
+
+    - name: Mounting /backup (mount -a)
+      shell:
+        cmd: mount -a
+      register: mount_backup
+      failed_when: "mount_backup.stderr"
+      when: "data_backup_lvm.stat.exists or data_vg_backup_lvm.stat.exists"
+
+- name: Sync Previous Backups
+  hosts: ubuntuhost
+  gather_facts: false
+  become: true
+
+  tasks:
+    - name: sync Previous Backups to Host
+      ansible.posix.synchronize:
+        src: "/backup/{{ inventory_hostname }}"
+        dest: "/backup/"
+        delete: true
+
+- name: Reset Backup Files Owner
+  hosts: ubuntuhost
+  gather_facts: false
+  become: true
+
+  tasks:
+    - name: Reset Backup Files Owner and Permissions
+      file:
+        path: /backup
+        state: directory
+        owner: clint
+        group: backup-admin
+        mode: "g+w,o="
+        recurse: true
+
+- name: Backup Restore
+  hosts: ubuntuhost
+  gather_facts: false
+  become: true
+
+  vars:
+    restore_dir: /restore
+
+  tasks:
+    - name: Find Latest Backup File
+      shell:
+        cmd: "ls -r /backup/{{ inventory_hostname }}/backup.*.tar.gz | head -1"
+      register: backup_file
+      changed_when: "'backup.' not in backup_file.stdout"
+      failed_when: "backup_file.stderr"
+
+    - name: Previous Restore Files Exist
+      file:
+        path: "{{ restore_dir }}"
+        state: absent
+
+    - name: Restore Root Directory
+      file:
+        path: "{{ restore_dir }}"
+        state: directory
+
+    - name: Extract Backup
+      unarchive:
+        src: "{{ backup_file.stdout }}"
+        dest: "{{ restore_dir }}"
+        remote_src: true
+
+    - name: Restore rsyslog.conf
+      shell:
+        cmd: "mv {{ restore_dir }}/etc/rsyslog.conf /etc/"
+      register: move_file
+      changed_when: "move_file.stdout"
+      failed_when: "move_file.stderr"
+
+    - name: Restore rsyslog.d Files
+      ansible.posix.synchronize:
+        src: "{{ restore_dir }}/etc/rsyslog.d"
+        dest: "/etc/"
+        compress: false
+        delete: true
+      delegate_to: "{{ inventory_hostname }}"
+
+    - name: Check for /var/log/syslog.log
+      stat:
+        path: "/var/log/syslog.log"
+      register: syslog_log
+
+    - name: Restore Logs
+      ansible.posix.synchronize:
+        src: "{{ restore_dir }}/var/log"
+        dest: "/var/"
+        compress: false
+      delegate_to: "{{ inventory_hostname }}"
+      when: "not syslog_log.stat.exists"
+
+    - name: syslog Log File
+      stat:
+        path: "/var/log/syslog"
+      register: syslog_file
+
+    - name: Restore old logs
+      shell:
+        cmd: "cat /var/log/syslog >> /var/log/syslog.log"
+      register: syslog_merge
+      changed_when: "syslog_merge.stdout"
+      failed_when: "syslog_merge.stderr"
+      when: "syslog_file.stat.exists"
+
+    - name: Retrieve List of Restored syslog.log Files
+      shell:
+        cmd: 'ls -1 /var/log/syslog.log*'
+      register: syslog_files
+      changed_when: "0"
+      failed_when: "syslog_files.stderr or not syslog_files.stdout"
+
+    - name: Reset syslog.log Permissions
+      file:
+        path: "{{ item }}"
+        owner: syslog
+        group: adm
+        mode: '640'
+      loop: "{{ syslog_files.stdout_lines }}"
+
+    - name: Start rsyslog
+      service:
+        name: rsyslog
+        state: restarted
+
+    - name: Delete rsyslog.d Backup Directory
+      file:
+        path: "{{ restore_dir }}/etc/rsyslog.d"
+        state: absent
+
+    - name: Delete log Backup Directory
+      file:
+        path: "{{ restore_dir }}/var/log"
+        state: absent
+
+    - name: Delete Log Files
+      file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /var/log/auth.log
+        - /var/log/kern.log
+        - /var/log/syslog
+
+    - name: Set crontab Restore Directory
+      set_fact:
+        crondir: "{{ restore_dir }}/var/spool/cron/crontabs"
+
+    - name: Retrieve List of User crontab Files
+      shell:
+        cmd: "cd {{ crondir }} && ls -1"
+      register: crontab_files
+      failed_when: "crontab_files.stderr or not crontab_files.stdout"
+
+    - name: Strip Off Edit Warnings from User crontab Files
+      shell:
+        cmd: "awk 'NR>3' '{{ crondir }}/{{ item }}' > {{ crondir }}/{{ item }}.crontab"
+      loop: "{{ crontab_files.stdout_lines }}"
+
+    - name: Restoring User crontabs
+      shell:
+        cmd: "crontab -u {{ item }} {{ crondir }}/{{ item }}.crontab"
+      loop: "{{ crontab_files.stdout_lines }}"
+
+    - name: Delete User crontab Backup Directory
+      file:
+        path: "{{ restore_dir }}/var/spool"
+        state: absent
+
+    - name: Find Backup Directories to Restore
+      shell:
+        cmd: "cd {{ restore_dir }} && ls -1"
+      register: restore_dirs
+      failed_when: "restore_dirs.stderr"
+
+    - name: Restore Remaining Files
+      ansible.posix.synchronize:
+        src: "{{ restore_dir }}/{{ item }}"
+        dest: "/"
+        compress: false
+      delegate_to: "{{ inventory_hostname }}"
+      loop: "{{ restore_dirs.stdout_lines }}"
+
+    - name: Delete Data Restore Directory
+      file:
+        path: "{{ restore_dir }}"
+        state: absent
+
+    - name: Retrieve List of Home Directories
+      shell:
+        cmd: "cd /home && ls -1"
+      register: home_dirs
+      failed_when: "home_dirs.stderr or not home_dirs.stdout"
+
+    - name: Resetting Home Directory Owners
+      file:
+        path: "/home/{{ item }}"
+        state: directory
+        owner: "{{ item }}"
+        group: "{{ item }}"
+        recurse: true
+      loop: "{{ home_dirs.stdout_lines }}"
+
+    - name: Resetting Home Directories to Private
+      file:
+        path: "/home/{{ item }}"
+        state: directory
+        mode: '2750'
+      loop: "{{ home_dirs.stdout_lines }}"
+
+    - name: Reset /opt/clintosaurous Owner
+      file:
+        path: "/opt/clintosaurous"
+        state: directory
+        owner: "{{ clintosaurous_user }}"
+        group: "{{ clintosaurous_group }}"
+        recurse: true
+      when: "'ddidev' not in group_names"
+
+    - name: Check If System netplan Configuration Exists
+      stat:
+        path: "/etc/netplan/00-{{ inventory_hostname }}.yaml"
+      register: sys_netplan
+
+    - name: Delete Default netplan Configuration
+      file:
+        path: "/etc/netplan/00-installer-config.yaml"
+        state: absent
+      when: sys_netplan.stat.exists
+
+- name: Reset Backup Directory
+  hosts: ubuntuhost
+  gather_facts: false
+  become: true
+
+  tasks:
+    - name: Reset /backup Directory Owner and Permissions
+      file:
+        path: /backup
+        owner: clint
+        group: backup-admin
+        state: directory
+        mode: "g+srw,o="
+        recurse: true

@@ -1,0 +1,109 @@
+#!/bin/bash
+
+# This script checks to see if the supplied VPN connection is up and attempts
+# start if there is Internet connectivity.
+# vpn-check connection-name passwd-file
+#
+# See nmcli help for password file format.
+
+VERSION='1.3.0'
+LAST_UPDATED='2022-10-08'
+
+
+. /opt/clintosaurous/core/lib/sh/general.sh
+
+
+# Must be ran as root.
+check_login_user root
+
+
+ERRORFILE='/tmp/vpn-check.error'
+EMAIL_TO='clint@clintosaurous.com'
+#EMAIL_TO='8133177287@tmomail.net'
+
+
+_error_message ()
+{
+    MSG=$1
+    shift
+
+    log_msg "$MSG"
+    if [ ! -e $ERRORFILE ]; then
+        log_msg "$MSG" > $ERRORFILE
+        log_msg "$MSG" | mail -s "`hostname -s` VPN Connectivity Check" \
+            "$EMAIL_TO"
+    fi
+}
+
+
+_success_message ()
+{
+    MSG=$1
+    shift
+
+    log_msg "$MSG"
+    if [ -e $ERRORFILE ]; then
+        rm -f $ERRORFILE
+        log_msg "$MSG" \
+            | mail -s "`hostname -s` VPN Connectivity Check" \
+            "$EMAIL_TO"
+    fi
+}
+
+
+# Get connection name.
+if [ ! "$1" ] ; then echo "Missing connection name argument!" 2>&2 ; exit ; fi
+CONNECTION=$1
+shift
+
+# Get password file.
+if [ ! "$1" ] ; then echo "Missing password file argument!" 2>&2 ; exit ; fi
+PASSFILE=$1
+shift
+
+# Check paaword file.
+if [ ! -e "$PASSFILE" ] ; then
+    _error_message "Password file does not exist!"
+    exit 1
+fi
+
+# Check Internet connectivty.
+#   Google
+PING=`ping -c 4 -W 2 -q 8.8.8.8 2>&1 \
+    | grep received | sed -r 's/^.+ ([0-9]+) received.+$/\1/'`
+if [ ! "$PING" ]; then PING=0 ; fi
+
+
+# Check current status.
+STATUS=`nmcli connection show --active id "${CONNECTION}" 2>&1`
+if [ "$STATUS" ]; then
+    log_msg "VPN ${CONNECTION} is up."
+    if [ -e $ERRORFILE ]; then rm -f $ERRORFILE ; fi
+    if [ $PING -lt 1 ]; then
+        _error_message "Internet connectivity through VPN is down."
+        nmcli connection down id "${CONNECTION}" 2>&1
+        sleep 5
+    else
+        exit 0
+    fi
+elif [ $PING -le 2 ]; then
+    log_msg "Internet is down. Will not attempt reconnect."
+    exit 1
+fi
+
+_error_message "VPN ${CONNECTION} is down."
+
+
+# Start VPN
+log_msg "Attempting to connect VPN ${CONNECTION}..."
+NMCLI=`nmcli connection up id "${CONNECTION}" passwd-file "${PASSFILE}" 2>&1`
+CONNECT=`echo $NMCLI | \
+    sed -r 's/^.*(Connection successfully activated).+$/\1/'`
+if [ "$CONNECT" = "Connection successfully activated" ]; then
+    _success_message "VPN ${CONNECTION} connected successfully."
+else
+    _error_message "VPN ${CONNECTION} failed to connect: $NMCLI"
+    exit 1
+fi
+
+exit 0

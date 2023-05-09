@@ -1,0 +1,32 @@
+---
+# Provision common system information on an Ubuntu 20.04 or 22.04 server.
+#
+# Version: 1.1.3
+# Last Updated: 2023-05-09
+
+- name: Common System Provisioning
+  hosts: desktop:ubuntuhost
+  gather_facts: false
+  become: true
+
+  tasks:
+    # Update hostname to fully qualified name set in `group_vars/all.yaml`.
+    - name: Update Hostname
+      hostname:
+        name: "{{ fqdn }}"
+
+    # By default, server installations do not allocate all disk space to the
+    # root partition. Expand the root partition to use all remaining space.
+    # Exclude VirtualBox servers.
+    - name: Fully Expand Root Partition
+      lvol:
+        vg: ubuntu-vg
+        lv: ubuntu-lv
+        size: "+100%FREE"
+        resizefs: true
+        force: yes
+      when: "'vboxsrv' not in group_names"
+
+    - name: Set Time Zone to Eastern
+      timezone:
+        name: "America/New_York"

@@ -1,0 +1,129 @@
+#!/opt/clintosaurous/venv/bin/python3 -Bu
+
+"""
+Queries the LibreNMS database for memory information for each host and outputs
+to a text table.
+"""
+
+
+import clintosaurous.credentials as credentials
+import clintosaurous.db
+import clintosaurous.opts
+import clintosaurous.text
+
+
+VERSION = '1.3.1'
+LAST_UPDATE = '2022-12-01'
+
+
+def bytedown(bytes: int) -> str:
+
+    if opts.gigabytes:
+        if bytes == 0:
+            return '0.00GB'
+        return f'{round(bytes / 1073741824, 2):,}GB'
+
+    for increment in ['B', 'KB', 'MB', 'GB', 'TB']:
+        if bytes < 1024:
+            return f'{round(bytes, 2):,}{increment}'
+        bytes /= 1024
+
+    if bytes:
+        return f'{round(bytes, 2):,}TB'
+
+
+def cli_opts() -> clintosaurous.opts.argparse.Namespace:
+
+    """
+    Define CLI options.
+    """
+
+    clintosaurous.opts.parser.description = """
+        Queries the LibreNMS database for memory information for each host and
+        outputs to a text table.
+    """
+
+    clintosaurous.opts.parser.add_argument(
+        '-f', '--free',
+        help='Sort based on the amount of memory free.',
+        action='store_true'
+    )
+
+    clintosaurous.opts.parser.add_argument(
+        '-g', '--gigabytes',
+        help='Break down all byte counts to gigabies.',
+        action='store_true'
+    )
+
+    clintosaurous.opts.parser.add_argument(
+        '-p', '--percent-free',
+        help='Sort based on percentage of memory free.',
+        action='store_true'
+    )
+
+    clintosaurous.opts.parser.add_argument(
+        '-t', '--total',
+        help='Sort based on total amount of memory the host has.',
+        action='store_true'
+    )
+
+    return clintosaurous.opts.cli()
+
+
+if __name__ == '__main__':
+    opts = cli_opts()
+    user, passwd = credentials.data().get('mysql-report_ro')
+    db = clintosaurous.db.connect(
+        host='mysql1.clintosaurous.com',
+        user=user,
+        passwd=passwd,
+        database='librenms',
+        logging=False
+    )
+    sql = """
+        select
+            case
+                when d.display is null then d.hostname
+                else d.display
+            end as disp_host,
+            m.mempool_total,
+            m.mempool_free,
+            concat('(', 100 - m.mempool_perc, '%)') as percent_free,
+            m.mempool_used,
+            concat('(', m.mempool_perc, '%)') as percent_used
+
+        from devices as d
+
+        inner join mempools as m
+            on m.device_id = d.device_id
+
+        where
+            m.mempool_descr in (
+                'Physical memory',
+                'Real Memory',
+                'Real Memory Metrics'
+            )
+    """
+    if opts.free:
+        sql += 'order by m.mempool_free desc'
+    elif opts.percent_free:
+        sql += 'order by m.mempool_perc desc'
+    elif opts.total:
+        sql += 'order by m.mempool_total desc'
+    else:
+        sql += "order by disp_host"
+    cursor = db.cursor()
+    row_cnt = cursor.execute(sql)
+
+    rpt_rows = [["Host", "Total", "Free", "Used"]]
+    for db_row in cursor:
+        row = list(db_row)
+        rpt_rows.append([
+            row[0],
+            bytedown(row[1]).rjust(9),
+            f'{bytedown(row[2]).rjust(9)} {row[3].rjust(5)}',
+            f'{bytedown(row[4]).rjust(9)} {row[5].rjust(5)}',
+        ])
+    cursor.close()
+
+    print(clintosaurous.text.table(rpt_rows))

@@ -1,0 +1,56 @@
+#!/opt/clintosaurous/venv/bin/python3 -Bu
+
+"""
+Queries the LibreNMS database for host OS information for each host and
+outputs to a text table.
+"""
+
+
+import clintosaurous.credentials as credentials
+import clintosaurous.db
+import clintosaurous.text
+
+
+VERSION = "2.1.0"
+LAST_UPDATE = "2022-10-10"
+
+
+if __name__ == '__main__':
+    user, passwd = credentials.data().get('mysql-report_ro')
+    db = clintosaurous.db.connect(
+        host='mysql1.clintosaurous.com',
+        user=user,
+        passwd=passwd,
+        database='librenms',
+        logging=False
+    )
+
+    sql = """
+        select
+            case
+                when display is null then hostname
+                else display
+            end as hostname,
+            case
+                when features is not null then features
+                when os is not null then os
+                else null
+            end as features,
+            version
+        from devices
+        where
+            version is not null
+            and (
+                features is not null
+                or (os is not null and os != '')
+            )
+        order by hostname
+    """
+    cursor = db.cursor()
+    row_cnt = cursor.execute(sql)
+
+    rpt_rows = [["Host", "OS Version", "Kernel Version"]]
+    rpt_rows += [r for r in cursor.fetchall()]
+    cursor.close()
+
+    print(clintosaurous.text.table(rpt_rows))

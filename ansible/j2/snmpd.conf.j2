@@ -1,0 +1,37 @@
+# Ansible Generated SNMPD Configuration
+#
+# Template snmpd.conf.j2:
+#   Version: 1.0.1
+#   Last Updated: 2023-05-01
+
+agentAddress udp:161
+
+{% for mgmt_host in mgmt_hosts %}
+# {{ mgmt_host.host }}
+rocommunity '{{ clint_snmp_ro }}' {{ mgmt_host.ip }}
+{% endfor %}
+
+sysName {{ ansible_facts.fqdn }}
+sysLocation {{ clint_snmp_location }}
+sysContact {{ clint_snmp_contact }}
+
+# LibreNMS Extensions
+extend distro /usr/bin/distro
+extend hardware '/bin/cat /sys/devices/virtual/dmi/id/product_name'
+extend manufacturer '/bin/cat /sys/devices/virtual/dmi/id/sys_vendor'
+extend serial '/bin/cat /sys/devices/virtual/dmi/id/product_serial'
+{% if 'apache2' in group_names %}
+extend apache /etc/snmp/apache-stats.py
+{% endif %}
+{% if 'ddidns' in group_names %}
+extend bind /etc/snmp/bind
+{% endif %}
+{% if 'ddidhcp' in group_names %}
+extend dhcpstats /etc/snmp/dhcp.py
+{% endif %}
+{% if 'mysqlsrv' in group_names %}
+extend mysql /etc/snmp/mysql
+{% endif %}
+
+# Process Monitoring
+proc rsyslogd

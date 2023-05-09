@@ -1,0 +1,314 @@
+---
+# Provision UFW Rules On Ubuntu Hosts
+#
+# Version: 1.2.1
+# Last Updated: 2023-05-09
+
+- name: Disable and Reset UFW Rules
+  hosts: desktop:ubuntuhost
+  gather_facts: false
+  become: true
+
+  tasks:
+    - name: Reset UFW
+      ufw:
+        state: reset
+
+    # By default, UFW does not log connections that match a rule. Enable
+    # logging accepted connections.
+    - name: Enable Logging By Default
+      ufw:
+        logging: "on"
+
+    # Allow SSH from management hosts only. Hosts are defined in
+    # `group_vars/all.yaml`.
+    - name: SSH Allow
+      ufw:
+        comment: "SSH from {{ item.host }}"
+        rule: allow
+        from_ip: "{{ item.ip }}"
+        proto: tcp
+        to_port: "22"
+      when: "inventory_hostname != 'mylaptop'"
+      loop: "{{ mgmt_hosts }}"
+      loop_control:
+        label: "{{ item.host }}"
+
+
+# Ignore all routers IGMP messages from all zeros address with logging
+# disabled. It is valid traffic in general, but not needed on most Ubuntu
+# hosts and just fills up the logs with deny messages.
+- name: IGMP Firewall Rules
+  hosts: "!ufwrouter:&ubuntuhost"
+  gather_facts: false
+  become: true
+
+  tasks:
+    - name: Reject 0.0.0.0 to Routers IGMP
+      ufw:
+        comment: Any Router IGMP
+        rule: reject
+        from_ip: 0.0.0.0
+        to_ip: 224.0.0.1
+        proto: igmp
+        log: false
+
+
+# Allow VRRP messages on VRRP hosts, else reject all VRRP traffic. Logging is
+# disabled so the logs don't get filled up with the once a second
+# announcements.
+- name: VRRP Firewall Rules
+  hosts: desktop:ubuntuhost
+  gather_facts: false
+  become: true
+
+  tasks:
+    - name: VRRP Announcements
+      ufw:
+        comment: VRRP Announcements
+        rule: "{{ 'allow' if 'keepalived' in group_names else 'reject' }}"
+        from_ip: 192.168.0.0/20
+        to_ip: 224.0.0.18
+        log: false
+
+
+# Allow management access from management hosts as defined in
+# `group_vars/all.yaml`.
+- name: Management Firewall Rules
+  hosts: desktop:ubuntuhost
+  gather_facts: false
+  become: true
+
+  tasks:
+    # Allow SNMP from management hosts.
+    - name: SNMP Allow
+      ufw:
+        comment: "SNMP from {{ item.host }}"
+        rule: allow
+        from_ip: "{{ item.ip }}"
+        proto: udp
+        to_port: "161"
+      loop: "{{ mgmt_hosts }}"
+      loop_control:
+        label: "{{ item.host }}"
+
+
+- name: DHCP Server Firewall Rules
+  hosts: ddidhcp
+  gather_facts: false
+  become: true
+
+  tasks:
+    # Allow all DHCP traffic from local nets.
+    - name: DHCP Allow
+      ufw:
+        comment: DHCP
+        rule: allow
+        from_ip: 192.168.0.0/20
+        proto: udp
+        to_port: "67"
+
+    # Allow DHCP discovery messages.
+    - name: DHCP Allow
+      ufw:
+        comment: DHCP
+        rule: allow
+        from_ip: 0.0.0.0
+        to_ip: 255.255.255.255
+        proto: udp
+        to_port: "67"
+
+    # Allow DHCP server pool communications.
+    - name: DHCP Pool Peer Allow
+      ufw:
+        comment: DHCP Pool Peer Allow
+        rule: allow
+        from_ip: 192.168.0.0/20
+        proto: tcp
+        to_port: "847"
+
+
+- name: DNS Server Firewall Rules
+  hosts: "!desktop:&ddidns"
+  gather_facts: false
+  become: true
+
+  tasks:
+    # Allow DNS connections on both TCP and UDP.
+    - name: DNS Allow
+      ufw:
+        comment: DNS
+        rule: allow
+        from_ip: 192.168.0.0/20
+        to_port: "53"
+
+
+# There are hosts that run DHCP services locally, but do not service other
+# clients. On those hosts, we only need access from the master name server and
+# NOC hosts.
+- name: DNS On Desktop Firewall Rules
+  hosts: "desktop:&ddidns"
+  gather_facts: false
+  become: true
+
+  tasks:
+    - name: DNS Allow
+      ufw:
+        comment: DNS from ns1
+        rule: allow
+        from_ip: "{{ item }}"
+        to_port: "53"
+      loop: "{{ clint_ns1 }}"
+
+    - name: DNS Allow
+      ufw:
+        comment: DNS from NOC
+        rule: allow
+        from_ip: "{{ clint_noc }}"
+        to_port: "53"
+
+
+- name: HTTPS Server Firewall Rules
+  hosts: apache2:ddimgt
+  gather_facts: false
+  become: true
+
+  tasks:
+    - name: HTTPS Allow
+      ufw:
+        comment: HTTPS
+        rule: allow
+        from_ip: 192.168.0.0/20
+        proto: tcp
+        to_port: "443"
+
+
+- name: MySQL Server Firewall Rules
+  hosts: mysqlsrv
+  gather_facts: false
+  become: true
+
+  tasks:
+    - name: MySQL Allow
+      ufw:
+        comment: MySQL
+        rule: allow
+        from_ip: 192.168.0.0/20
+        proto: tcp
+        to_port: "3306"
+
+
+- name: NOC Server Firewall Rules
+  hosts: nocsrv
+  gather_facts: false
+  become: true
+
+  tasks:
+    - name: syslog Allow
+      ufw:
+        comment: syslog
+        rule: allow
+        from_ip: 192.168.0.0/20
+        proto: udp
+        to_port: "514"
+
+
+- name: Passbolt Server Firewall Rules
+  hosts: passboltsrv
+  gather_facts: false
+  become: true
+
+  tasks:
+    - name: Passbolt Allow
+      ufw:
+        comment: Passbolt
+        rule: allow
+        from_ip: 192.168.0.0/20
+        proto: tcp
+        to_port: "8443"
+
+
+- name: Plex Server Firewall Rules
+  hosts: plexsrv
+  gather_facts: false
+  become: true
+
+  tasks:
+    - name: Plex TCP Allow
+      ufw:
+        comment: Plex TCP
+        rule: allow
+        from_ip: 192.168.0.0/20
+        proto: tcp
+        to_port: "30000:65535"
+
+    - name: Plex UDP Allow
+      ufw:
+        comment: Plex UDP
+        rule: allow
+        from_ip: 192.168.0.0/20
+        proto: udp
+        to_port: "1901,30000:65535"
+
+
+- name: VirtualBox Server Firewall Rules
+  hosts: "!desktop:vboxsrv"
+  gather_facts: false
+  become: true
+
+  tasks:
+    - name: VirtualBox Web Management Allow
+      ufw:
+        comment: "VBox Web Mgmt from {{ item.host }}"
+        rule: allow
+        from_ip: "{{ item.ip }}"
+        proto: tcp
+        to_port: "18083"
+      loop: "{{ mgmt_hosts }}"
+      loop_control:
+        label: "{{ item.host }}"
+
+    - name: VirtualBox Remote Consoles Allow
+      ufw:
+        comment: "VBox Consoles from {{ item.host }}"
+        rule: allow
+        from_ip: "{{ item.ip }}"
+        proto: tcp
+        to_port: "3389:3410"
+      loop: "{{ mgmt_hosts }}"
+      loop_control:
+        label: "{{ item.host }}"
+
+
+- name: Ubuntu Router UFW Rules
+  hosts: ufwrouter
+  gather_facts: true
+  become: true
+
+  tasks:
+    - name: Deny Any to Self
+      ufw:
+        comment: "Deny Any to Own IP {{ item }}"
+        rule: deny
+        to_ip: "{{ item }}"
+      loop: "{{ ansible_all_ipv4_addresses }}"
+
+    - name: Allow Any Traffic From Known Networks
+      ufw:
+        comment: "Allow Any Any"
+        rule: allow
+        route: true
+        from_ip: 0.0.0.0/0
+        to_ip: 0.0.0.0/0
+        log: false
+
+
+- name: Enable UFW
+  hosts: desktop:ubuntuhost
+  gather_facts: false
+  become: true
+
+  tasks:
+    - name: Enable UFW
+      ufw:
+        state: enabled

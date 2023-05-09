@@ -1,0 +1,112 @@
+---
+owner: mgmt-svc
+group: mgmt
+
+bak_files:
+  - /etc/crypttab
+  - /etc/fstab
+  - /etc/hosts
+
+home:
+  - bin
+  - .bashrc
+  - .env
+  - .my.cnf
+  - .profile
+  - .ssl
+  - .ssh
+  - .vimrc
+
+paths:
+  all:
+    - /etc/clintosaurous
+    - /etc/initramfs-tools/conf.d/resume
+    - /etc/netplan
+    - /etc/nsswitch.conf
+    - /etc/snmp/snmpd.conf
+    - /etc/sysctl.d/*-ipv*
+    - /var/log/clintosaurous
+    - /var/log/syslog.*
+    - /var/spool/cron/crontabs
+
+  ansiblehost:
+    - /data/ca
+    - /etc/aliases*
+    - /etc/ansible
+    - /etc/logrotate.d/clint*
+    - /etc/logrotate.d/rsyslog
+    - /etc/postfix
+    - /etc/rsyslog.conf
+    - /etc/rsyslog.d
+    - /etc/ssh/pre-login-banner.txt
+    - /etc/ssh/sshd_config
+    - /etc/skel
+
+  apache2:
+    - /etc/apache2/*.key
+    - /etc/apache2/*.pem
+    - /etc/apache2/htpasswd
+    - /etc/apache2/ports
+    - /etc/apache2/sites-available
+    - /etc/apache2/sites-enabled
+    - /etc/snmp/apache*
+    - /var/www
+
+  ddidhcp: 
+    - /etc/dhcp/clintosaurous*
+    - /etc/dhcp/dhcpd.conf
+    - /etc/snmp/dhcp*
+    - /usr/lib/dhcp/dhcpd.leases
+
+  ddidns:
+    - /etc/bind
+    - /etc/snmp/bind*
+    - /var/cache/bind
+
+  desktop:
+    - /etc/snmp/nvidia
+    - /opt/clintosaurous/core
+    - /opt/clintosaurous/ddi
+    - /opt/clintosaurous/home
+    - /opt/clintosaurous-dev/ddi
+    - /opt/clintosaurous-dev/ddi.old
+    - /opt/clintosaurous-dev/home
+
+  keepalived:
+    - /etc/keepalived
+
+  mysqlsrv:
+    - /etc/mysql/*.key
+    - /etc/mysql/*.pem
+    - /etc/mysql/mysql.conf.d
+
+  nginxsrv:
+    - /etc/nginx
+
+  stubbysrv:
+    - /etc/stubby
+
+  ufwrouter:
+    - /etc/ufw/before.rules
+
+  vboxsrv:
+    - /etc/default/virtualbox
+    - /etc/systemd/network
+    - /etc/systemd/system/vbox-*
+    - /root/.sdb
+    - /root/.sdb1
+    - /root/.nvebackup
+
+service_paths:
+  librenms:
+    - /opt/librenms/.env
+    - /opt/librenms/config.php
+    - /opt/librenms/rrd
+    - /usr/lib/nagios/plugins/check_ip_exists
+    - /usr/lib/nagios/plugins/check_proc_cnt
+    - /usr/lib/nagios/plugins/check_snmp_linux
+    - /usr/lib/nagios/plugins/check_snmp_linux_ip
+    - /var/cache/librenms
+
+  plexsrv:
+    - /var/lib/plexmediaserver

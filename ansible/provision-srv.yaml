@@ -1,0 +1,15 @@
+---
+# Master Playbook for Provisioning New Ubuntu Host
+#
+# Version: 1.3.0
+# Last Updated: 2023-05-09
+
+# Order of scripts is important.
+- import_playbook: provision-system-common.yaml
+- import_playbook: provision-users-common.yaml
+- import_playbook: provision-apt-common.yaml
+- import_playbook: provision-files-common.yaml
+#- import_playbook: provision-restore-backup.yaml
+- import_playbook: provision-vbox-extensions.yaml
+- import_playbook: provision-ufw.yaml
+- import_playbook: provision-end.yaml

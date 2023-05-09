@@ -1,0 +1,66 @@
+#!/opt/clintosaurous/venv/bin/python3 -Bu
+
+"""
+This script performs a backup of different data and configuration files to
+the /backup directory.
+"""
+
+
+import os
+import re
+
+
+VERSION = '2.0.1'
+LAST_UPDATE = '2022-10-21'
+
+
+if __name__ == '__main__':
+    host = os.popen('hostname').read().strip()
+    domain = os.popen('dnsdomainname').read().strip()
+    if not re.search(r'\.', host):
+        host += f'.{domain}'
+
+    os_name = os.popen('lsb_release -ds').read().strip()
+    version = os.popen('uname -r').read().strip()
+    os_name += f' ({version})'
+
+    uptime = os.popen('uptime -p').read().strip()
+
+    output = (
+        f'Name:    {host}\n' +
+        f'OS:      {os_name}\n' +
+        f'Up Time: {uptime}\n' +
+        '\nInterfaces:\n'
+    )
+
+    ip_addr = os.popen('ip address').read().strip()
+
+    for line in ip_addr.split('\n'):
+        match = re.match(r'\d:\s+(\S+):', line)
+        if match:
+            print(f'    {match.group(1)}')
+        match = re.match(r'\s+link\/\w+\s+(\S+)', line)
+        if match:
+            print(f'        MAC: {match.group(1)}')
+        match = re.search(r'inet6?\s+(\S+)', line)
+        if match:
+            print(f'        IP:  {match.group(1)}')
+
+    print('\nRoutes:\n')
+    print('    Network             Next Hop         Metric  Interface')
+    print('    ' + '-'*54)
+
+    ip_route = os.popen('ip route').read().strip()
+
+    for line in ip_route.split('\n'):
+        match = re.match(
+            r'(\S+)\s+via\s+(\S+)\s+dev\s+(\S+).+ metric (\d+)', line)
+        if not match:
+            continue
+
+        out_line = '    '
+        out_line += match.group(1).ljust(18) + '  '
+        out_line += match.group(2).ljust(15) + '  '
+        out_line += match.group(4).ljust(6) + '  '
+        out_line += match.group(3)
+        print(out_line)

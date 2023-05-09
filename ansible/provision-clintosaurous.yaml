@@ -1,0 +1,152 @@
+---
+# Provision Clintosaurous Tools on an Ubuntu 20.04 or 22.04 server.
+#
+# Version: 2.1.1
+# Last Updated: 2023-01-09
+
+- name: Retrieve Clintosaurous Security Information
+  hosts: localhost
+  gather_facts: false
+
+  tasks:
+    - name: Clintosaurous Password
+      shell:
+        cmd: "/opt/clintosaurous/home/bin/passbolt-query.sh -p {{ clintosaurous_user }}"
+      register: passbolt_passwd
+      changed_when: "not passbolt_passwd.stdout"
+      failed_when: "not passbolt_passwd.stdout or passbolt_passwd.stderr"
+
+    - name: Clintoaurous Public SSH Key
+      shell:
+        cmd: "/opt/clintosaurous/home/bin/passbolt-query.sh -p clintosaurous-ssh-pub-key"
+      register: clintosaurous_ssh_pub_key
+      changed_when: "not clintosaurous_ssh_pub_key.stdout"
+      failed_when: "not clintosaurous_ssh_pub_key.stdout or clintosaurous_ssh_pub_key.stderr"
+
+    - name: Store Clintosaurous Security Information
+      set_fact:
+        clintosaurous_passwd: "{{ passbolt_passwd.stdout }}"
+        clintosaurous_ssh_pub_key: "{{ clintosaurous_ssh_pub_key.stdout }}"
+
+
+- name: Set Variables
+  hosts: ubuntuhost
+  gather_facts: false
+
+  tasks:
+    - name: Clintosaurous Variables
+      set_fact:
+        clint_opt_base: "{{ '/opt/clintosaurous' if lab_host else '/opt/clintosaurous-prod' }}"
+        clintosaurous_passwd: "{{ hostvars.localhost.clintosaurous_passwd }}"
+        clintosaurous_ssh_pub_key: "{{ hostvars.localhost.clintosaurous_ssh_pub_key }}"
+        clint_db_user: "{{ clintosaurous_dev_user if lab_host else clintosaurous_user }}"
+
+
+- name: Clintosaurous Files
+  hosts: ubuntuhost
+  gather_facts: false
+  become: true
+
+  tasks:
+    - name: Create Clintosaurous Directory
+      file:
+        path: /opt/clintosaurous
+        state: directory
+        owner: clint
+        group: clint
+        recurse: true
+
+
+- name: Clintosaurous Files
+  hosts: ubuntuhost
+  gather_facts: false
+
+  tasks:
+    - name: Copy Clintosaurous Home Files
+      ansible.posix.synchronize:
+        src: "{{ clint_opt_base }}/{{ item }}"
+        dest: /opt/clintosaurous/
+        compress: false
+        delete: true
+        recursive: true
+      loop:
+        - core
+        - ddi
+        - home
+
+
+- import_playbook: /opt/clintosaurous/core/install.yaml
+
+- import_playbook: /opt/clintosaurous/ddi/install.yaml
+  when: "'ddihost' in group_names"
+
+- name: Clintosaurous Groups
+  hosts: ubuntuhost
+  gather_facts: false
+  become: true
+
+  tasks:
+    - name: Clintosaurous User Groups
+      user:
+        name: "{{ clintosaurous_user }}"
+        groups:
+          - lib-devl
+        append: true
+
+    - name: Clintosaurous Group Users
+      user:
+        name: "{{ item }}"
+        groups:
+          - "{{ clintosaurous_group }}"
+        append: true
+      loop: ['clint', 'maint-svc', 'clint', 'reports-svc', 'syslog']
+
+
+- name: Clintosaurous Home VENV Modules
+  hosts: ubuntuhost
+  gather_facts: false
+  become: true
+
+  tasks:
+    # Temporarily set Clintosaurous directory owner to root to perform git
+    # updates. This is reset at the end of the playbook.
+    - name: Clintosaurous VENV Directory Owner
+      file:
+        path: /opt/clintosaurous/venv
+        owner: root
+        group: root
+        recurse: true
+
+    - name: Home Environment pip Installs
+      pip:
+        requirements: /opt/clintosaurous/home/requirements.txt
+        virtualenv: /opt/clintosaurous/venv
+
+    - name: Clintosaurous Base Directory Owner
+      file:
+        path: /opt/clintosaurous/venv
+        owner: "{{ clintosaurous_user }}"
+        group: "{{ clintosaurous_group }}"
+        recurse: true
+
+    # Python certifi module has its own CA cache that needs to be updated
+    # manually. Ubuntu 20.04 uses Python 3.8, Ubuntu 22.04 uses 3.10.
+    - name: Copy Update CA Certificats to certifi
+      shell:
+        cmd: "cp /etc/ssl/certs/ca-certificates.crt /opt/clintosaurous/venv/lib/python3.{{ '8' if ansible_distribution_major_version == '20' else '10' }}/site-packages/certifi/cacert.pem"
+        warn: false
+      register: ca_copy
+      failed_when: "ca_copy.stderr"
+
+
+- name: Clintosaurous DDI Tools DNS Server
+  hosts: ddidns
+  gather_facts: false
+  become: true
+
+  tasks:
+    - name: DNS Server Required Packages
+      apt:
+        pkg:
+          - libfile-readbackwards-perl
+          - stubby

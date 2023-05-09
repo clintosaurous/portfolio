@@ -1,0 +1,131 @@
+---
+all:
+  hosts: {}
+
+  children:
+    ansiblehost:
+      hosts:
+        mgmt1:
+          ansible_ssh_host: 10.10.10.5
+        mylaptop:
+          ansible_connection: local
+
+    apache2:
+      hosts:
+        mgmt1:
+          ansible_ssh_host: 10.10.10.5
+
+    bkuphost:
+      hosts:
+        mgmt1:
+          ansible_ssh_host: 10.10.10.5
+
+    ddidhcp:
+      hosts:
+        ns1:
+          ansible_ssh_host: 10.10.10.11
+        ns2:
+          ansible_ssh_host: 10.10.10.12
+
+    ddidns:
+      hosts:
+        mylaptop:
+          ansible_connection: local
+        ns1:
+          ansible_ssh_host: 10.10.10.11
+        ns2:
+          ansible_ssh_host: 10.10.10.12
+
+    ddimgt:
+      hosts:
+        mgmt1:
+          ansible_ssh_host: 10.10.10.5
+
+    desktop:
+      hosts:
+        client1:
+          ansible_ssh_host: client1.clintosaurous.com
+        mylaptop:
+          ansible_connection: local
+
+    keepalived:
+      hosts:
+        ns1:
+          ansible_ssh_host: 10.10.10.11
+        ns2:
+          ansible_ssh_host: 10.10.10.12
+
+    librenms:
+      hosts: {}
+
+    mediahost:
+      hosts:
+        media1:
+          ansible_ssh_host: 10.10.11.251
+
+    mysqlsrv:
+      hosts:
+        mgmt1:
+          ansible_ssh_host: 10.10.10.5
+
+    nocsrv:
+      hosts:
+        mgmt1:
+          ansible_ssh_host: 10.10.10.5
+
+    plexsrv:
+      hosts:
+        media1:
+          ansible_ssh_host: 10.10.11.251
+
+    softwarehost:
+      hosts:
+        vmhost:
+          ansible_ssh_host: 10.10.11.250
+
+    stubbysrv:
+      hosts:
+        mylaptop:
+          ansible_connection: local
+        ns1:
+          ansible_ssh_host: 10.10.10.11
+        ns2:
+          ansible_ssh_host: 10.10.10.12
+
+    ubuntuhost:
+      hosts:
+        client1:
+          ansible_ssh_host: client1.clintosaurous.com
+        media1:
+          ansible_ssh_host: 10.10.11.251
+        mgmt1:
+          ansible_ssh_host: 10.10.10.5
+        ns1:
+          ansible_ssh_host: 10.10.10.11
+        ns2:
+          ansible_ssh_host: 10.10.10.12
+        vmhost:
+          ansible_ssh_host: 10.10.11.250
+
+    ufwrouter:
+      hosts:
+        vmhost:
+          ansible_ssh_host: 10.10.11.250
+
+    vboxsrv:
+      hosts:
+        vmhost:
+          ansible_ssh_host: 10.10.11.250
+
+    vmhosthost:
+      hosts:
+        client1:
+          ansible_ssh_host: client1.clintosaurous.com
+        media1:
+          ansible_ssh_host: 10.10.11.251
+        mgmt1:
+          ansible_ssh_host: 10.10.10.5
+        ns1:
+          ansible_ssh_host: 10.10.10.11
+        ns2:
+          ansible_ssh_host: 10.10.10.12

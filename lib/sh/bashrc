@@ -1,0 +1,55 @@
+# /etc/bash.bashrc include file for the Clintosaurous personal environment.
+#
+# Version: 1.0.0
+# Last Updated: 2022-10-08
+
+
+HOMEDIR=/opt/clintosaurous/home
+
+# Add Clintosaurous personal Python libraries to PYTHONPATH.
+export PYTHONPATH="$PYTHONPATH:$HOMEDIR/lib/python"
+
+# Add Clintosaurous personal scripts to path.
+export PATH="$HOMEDIR/bin:$HOMEDIR/hosts:$PATH"
+
+# Add user's bin directory to path.
+if [ -e $HOME/bin ] && [ -z "`echo $PATH | grep $HOME/bin`" ]; then
+    export PATH=$PATH:$HOME/bin
+fi
+
+# If not running interactively, don't setup user environment.
+[ -z "$PS1" ] && return
+
+# Disable requiring input after paste.
+bind 'set enable-bracketed-paste off'
+
+# Truncated hostname.
+CLINTHOSTNAME=`hostname | sed 's/\.clintosaurous\.com//'`
+
+# Set default prompt and window naming.
+#   Window title.
+PS1='\[\e]0;\u@$CLINTHOSTNAME \w\a\]'
+#   Actual prompt.
+export PS1=$PS1'\[\e[32m\]\u@$CLINTHOSTNAME \[\e[34m\]\w\[\e[0m\] \$ '
+
+export EDITOR=vim
+
+# Common command aliases
+alias df='df -h'
+alias egrep='egrep --color=auto'
+alias fgrep='fgrep --color=auto'
+alias free='free -h'
+alias la='ls -alh'
+alias ls='ls --color=auto'
+alias ll='ls -lh'
+alias path='echo $PATH'
+alias psg='ps -ef | grep'
+alias rm='rm -f'
+alias syslog='tail -100 /var/log/syslog.log'
+alias syslogg='tail -1000 /var/log/syslog.log | grep'
+alias tsyslog='tail -f /var/log/syslog.log'
+alias vi='vim'
+
+if [ -e "/etc/apache2/sites-available" ]; then
+    alias tapache='tail -f /var/log/apache2/error.log'
+fi

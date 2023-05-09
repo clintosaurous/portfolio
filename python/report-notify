@@ -1,0 +1,531 @@
+#!/opt/clintosaurous/venv/bin/python3 -Bu
+
+"""
+Sends a summary email of the latest reports generated.
+"""
+
+
+import clintosaurous.credentials as credentials
+from clintosaurous.datetime import datestamp, run_time
+import clintosaurous.db
+import clintosaurous.email as email
+import clintosaurous.log as log
+import clintosaurous.opts
+import getpass
+import time
+
+
+VERSION = '1.7.4'
+LAST_UPDATE = '2022-12-12'
+
+
+def cli_opts() -> clintosaurous.opts.argparse.Namespace:
+
+    """
+    Define CLI options.
+    """
+
+    clintosaurous.opts.parser.add_argument(
+        '-D', '--date',
+        help="""
+            Date to generate report data for. For reports that are not date
+            specific, a summary with the latest date will be used.
+            Default: Previous day.
+        """,
+        type=str,
+        default=datestamp(time.time() - 86400)
+    )
+    email = getpass.getuser() + '@clintosaurous.com'
+    clintosaurous.opts.parser.add_argument(
+        '-f', '--email_from',
+        help=f'Email address to send the mails from. Default: {email}',
+        type=str,
+        default=email
+    )
+    clintosaurous.opts.parser.add_argument(
+        '-t', '--email_to',
+        help=f'Email address to send the mails to. Default: {email}',
+        type=str,
+        default=email
+    )
+
+    return clintosaurous.opts.cli()
+
+# End cli_opts()
+
+
+def email_reports(rpts: list):
+
+    """
+    Send report email.
+    """
+
+    # Type hints.
+    if not isinstance(rpts, list):
+        raise TypeError(f'rpts expected `list`, received {type(rpts)}')
+
+    log.log(f'Emailing summary report to {opts.email_to}')
+
+    mail_txt = f"""
+        <h2 style="text-align: center">Monitoring summary reports
+        for {opts.date}</h2>
+    """
+
+    for rpt in rpts:
+        mail_txt += f"""
+            <p style="text-align: center"><hr width="30%"></p>
+            <h3 style="text-align: center">{rpt["title"]}</h3>
+            <p style="text-align: center">
+            <table style="margin-left: auto; margin-right: auto;">
+        """
+
+        try:
+            rpt["headings"]
+        except KeyError:
+            True
+        else:
+            mail_txt += (
+                """<tr><td><font style="font-weight: bold;">""" +
+                """</font></td><td><font style="font-weight: bold;">""".join(
+                    rpt["headings"]
+                ) + "</font></td></tr>\n"
+            )
+
+        for row in rpt["rows"]:
+            mail_txt += "<tr>"
+            for column in row:
+                mail_txt += f'<td>{column}</td>'
+            mail_txt += "</tr>\n"
+
+        mail_txt += "</table></p>"
+
+    email.send(
+        opts.email_to, opts.email_from,
+        f'Summary Report for {opts.date}', mail_txt
+    )
+
+# End email_reports()
+
+
+def summary_dns(db: clintosaurous.db.connect) -> dict:
+
+    """
+    Generate DNS summary report.
+
+    `db`: Reports database handle.
+    """
+
+    log.log(f'Generating DNS summary report for {opts.date}')
+
+    title = "DNS Query Report"
+    headings = ['', 'Count', 'Date', 'Previous', 'Date', 'Diff.']
+    rows = []
+
+    log.log(f'Querying total DNS queries for {opts.date}')
+    sql = """
+        select
+            'Total Queries' as zone_type,
+            q1.count,
+            q1.datestamp,
+            q2.count as prev_count,
+            q2.datestamp as prev_datestamp,
+            q1.count - q2.count as difference
+
+        from (
+            select
+                sum(q1a.count) as 'count',
+                q1a.datestamp
+            from dns_queries_per_server as q1a
+            where q1a.datestamp = %s
+        ) as q1
+
+        inner join (
+            select
+                sum(q2a.count) as 'count',
+                q2a.datestamp
+            from dns_queries_per_server as q2a
+            where
+                q2a.datestamp = (
+                    select max(q2b.datestamp)
+                    from dns_ad_malware_queries as q2b
+                    where q2b.datestamp < %s
+                )
+            group by q2a.datestamp
+        ) as q2
+            on q2.datestamp != q1.datestamp
+
+        union
+
+        select
+            m1.zone_type,
+            m1.count as count,
+            m1.datestamp,
+            m2.count as prev_count,
+            m2.datestamp as prev_datestamp,
+            m1.count - m2.count as difference
+
+        from (
+            select
+                m1a.zone_type, sum(m1a.count) as 'count',
+                m1a.datestamp
+            from dns_ad_malware_queries as m1a
+            where m1a.datestamp = %s
+            group by m1a.zone_type
+        ) as m1
+
+        inner join (
+            select
+                m2a.zone_type,
+                sum(m2a.count) as 'count',
+                m2a.datestamp
+            from dns_ad_malware_queries as m2a
+            where
+                m2a.datestamp = (
+                    select max(m2b.datestamp)
+                    from dns_ad_malware_queries as m2b
+                    where m2b.datestamp < %s
+                )
+            group by m2a.zone_type, m2a.datestamp
+        ) as m2
+            on m2.zone_type = m1.zone_type
+            and m2.datestamp != m1.datestamp
+    """
+    log.dbg(f'summary_dns(): sql:\n{sql}')
+    cursor = db.cursor()
+    cursor.execute(sql, [opts.date, opts.date, opts.date, opts.date])
+    for row in cursor:
+        rows.append([
+            row[0].title(),
+            f'{row[1]:,}',
+            row[2],
+            f'{row[3]:,}',
+            row[4],
+            f'{row[5]:,}'
+        ])
+    cursor.close()
+
+    return {
+        "title": title,
+        "headings": headings,
+        "rows": rows
+    }
+
+# End summary_dns()
+
+
+def summary_firewall(db: clintosaurous.db.connect) -> dict:
+
+    """
+    Generate firewall summary report.
+
+    `db`: Reports database handle.
+    """
+
+    log.log(f'Generating firewall summary report for {opts.date}')
+
+    title = 'Firewall Messages Report'
+    headings = [
+        'Rule Type',
+        'Count',
+        'Date',
+        'Previous',
+        'Date',
+        'Diff.'
+    ]
+    rows = []
+
+    log.log(f'Querying total firewall messages for {opts.date}')
+    sql = """
+        select
+            'Total' as rule_type,
+            f1.count,
+            f1.datestamp,
+            f2.count as prev_count,
+            f2.datestamp as prev_datestamp,
+            f1.count - f2.count as difference
+
+        from (
+            select
+                sum(f1a.count) as 'count',
+                f1a.datestamp
+            from firewall_protocol_summary as f1a
+            where f1a.datestamp = %s
+        ) as f1
+
+        inner join (
+            select
+                sum(f2a.count) as 'count',
+                f2a.datestamp
+            from firewall_protocol_summary as f2a
+            where
+                f2a.datestamp = (
+                    select max(f2b.datestamp)
+                    from firewall_protocol_summary as f2b
+                    where f2b.datestamp < %s
+                )
+            group by f2a.datestamp
+        ) as f2
+            on f2.datestamp != f1.datestamp
+
+        union
+
+        select
+            r1.rule_type,
+            r1.count,
+            r1.datestamp,
+            r2.count as prev_count,
+            r2.datestamp as prev_datestamp,
+            r1.count - r2.count as difference
+
+        from (
+            select
+                r1a.rule_type,
+                sum(r1a.count) as 'count',
+                r1a.datestamp
+            from firewall_protocol_summary as r1a
+            where r1a.datestamp = %s
+            group by r1a.rule_type, r1a.datestamp
+            order by r1a.rule_type
+        ) as r1
+
+        inner join (
+            select
+                r2a.rule_type,
+                sum(r2a.count) as 'count',
+                r2a.datestamp
+            from firewall_protocol_summary as r2a
+            where
+                r2a.datestamp = (
+                    select max(r2b.datestamp)
+                    from firewall_protocol_summary as r2b
+                    where r2b.datestamp < %s
+                )
+            group by r2a.rule_type, r2a.datestamp
+            order by r2a.rule_type
+        ) as r2
+            on r2.rule_type = r1.rule_type
+            and r2.datestamp != r1.datestamp
+    """
+    log.dbg(f'summary_firewall(): sql:\n{sql}')
+    cursor = db.cursor()
+    cursor.execute(sql, [opts.date, opts.date, opts.date, opts.date])
+    for row in cursor:
+        rows.append([
+            row[0].capitalize() + ' Messages',
+            f'{row[1]:,}',
+            row[2],
+            f'{row[3]:,}',
+            row[4],
+            f'{row[5]:,}'
+        ])
+    cursor.close()
+
+    return {
+        "title": title,
+        "headings": headings,
+        "rows": rows
+    }
+
+# End summary_firewall()
+
+
+def summary_syslog(db: clintosaurous.db.connect) -> dict:
+
+    """
+    Generate syslog summary report.
+
+    `db`: Reports database handle.
+    """
+
+    log.log('Generating syslog summary report')
+
+    title = 'syslog Messages Report'
+    headings = ['Severity', 'Count', 'Date', 'Previous', 'Date', 'Diff.']
+    rows = []
+
+    log.log("Querying syslog summary stats")
+    sql = """
+        select
+            'Total Messages' as priority,
+            t1.count,
+            t1.datestamp,
+            t2.count,
+            t2.datestamp,
+            t1.count - t2.count as difference
+
+        from (
+            select sum(t1a.count) as count, t1a.datestamp
+            from syslog_host_priority_summary as t1a
+            where t1a.datestamp = %s
+        ) as t1
+
+        inner join (
+            select sum(t2a.count) as count, t2a.datestamp
+            from syslog_host_priority_summary as t2a
+            where t2a.datestamp = (
+                select max(t2b.datestamp)
+                from syslog_host_priority_summary as t2b
+                where t2b.datestamp < %s
+            )
+            group by t2a.datestamp
+        ) as t2
+            on t2.datestamp < t1.datestamp
+    """
+
+    log.dbg(f'summary_syslog(): sql:\n{sql}')
+    cursor = db.cursor()
+    cursor.execute(sql, [opts.date, opts.date])
+    db_rows = cursor.fetchall()
+
+    sql = """
+        select
+            l.name,
+            t1.count,
+            t1.datestamp,
+            t2.count,
+            t2.datestamp,
+            t1.count - t2.count as difference
+
+        from (
+            select
+                t1a.datestamp,
+                t1a.priority,
+                sum(t1a.count) as count
+            from syslog_host_priority_summary as t1a
+            where t1a.datestamp = %s
+            group by t1a.datestamp, t1a.priority
+
+        ) as t1
+
+        inner join (
+            select
+                t2a.datestamp,
+                t2a.priority,
+                sum(t2a.count) as count
+            from syslog_host_priority_summary as t2a
+            where t2a.datestamp = (
+                select max(t2b.datestamp)
+                from syslog_host_priority_summary as t2b
+                where t2b.datestamp < %s
+            )
+            group by t2a.datestamp, t2a.priority
+        ) as t2
+            on t2.priority = t1.priority
+            and t2.datestamp < t1.datestamp
+
+        inner join syslog_levels as l
+            on l.level = t1.priority
+            and l.level <= 3
+
+        order by l.level
+    """
+
+    log.dbg(f'summary_syslog(): sql:\n{sql}')
+    cursor.execute(sql, [opts.date, opts.date])
+    db_rows += cursor.fetchall()
+    cursor.close()
+
+    for row in db_rows:
+        new_row = [
+            row[0],
+            f'{row[1]:,}',
+            row[2],
+            f'{row[3]:,}',
+            row[4],
+            f'{row[5]:,}'
+        ]
+        rows.append(new_row)
+
+    cursor.close()
+
+    return {
+        "title": title,
+        "headings": headings,
+        "rows": rows
+    }
+
+# End summary_syslog()
+
+
+def summary_vpn(db: clintosaurous.db.connect) -> dict:
+
+    """
+    Generate VPN messages summary report.
+
+    `db`: Reports database handle.
+    """
+
+    log.log('Generating VPN summary report')
+
+    title = 'VPN Connections Report'
+    headings = ['Username', 'Count']
+    rows = []
+
+    log.log('Querying VPN summary stats')
+    sql = """
+        select 'Total' as user, count(t1.msg_id)
+        from firewall_vpn_messages as t1
+        where t1.timestamp between %s and %s
+
+        union
+
+        select * from (
+            select user, count(c1a.user) as 'count'
+            from firewall_vpn_messages as c1a
+            where c1a.timestamp between %s and %s
+            group by user
+            order by c1a.user
+        ) as c1
+    """
+
+    sql_args = [
+        opts.date + ' 00:00:00',
+        opts.date + ' 23:59:59',
+        opts.date + ' 00:00:00',
+        opts.date + ' 23:59:59'
+    ]
+
+    log.dbg(f'summary_vpn(): sql:\n{sql}')
+    cursor = db.cursor()
+    cursor.execute(sql, sql_args)
+
+    rows = []
+    for row in cursor:
+        rows.append([row[0], f'{row[1]:,}'])
+
+    cursor.close()
+
+    return {
+        "title": title,
+        "headings": headings,
+        "rows": rows
+    }
+
+# End summary_vpn()
+
+
+if __name__ == '__main__':
+    opts = cli_opts()
+
+    log.log(f'Generating summary report for {opts.date}')
+
+    user, passwd = credentials.data().get('mysql-report_ro')
+    db = clintosaurous.db.connect(
+        host='mysql1.clintosaurous.com',
+        user=user,
+        passwd=passwd,
+        database='reports',
+        logging=True
+    )
+
+    rpts = []
+    rpts.append(summary_dns(db))
+    rpts.append(summary_firewall(db))
+    rpts.append(summary_vpn(db))
+    rpts.append(summary_syslog(db))
+    email_reports(rpts)
+
+    log.log('Disconnecting from reports database')
+    db.close()
+
+    log.log(f'Run time: {run_time()}')

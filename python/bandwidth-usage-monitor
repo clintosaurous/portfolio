@@ -1,0 +1,135 @@
+#!/opt/clintosaurous/venv/bin/python3 -Bu
+
+""" Monitor Bandwidth Utilization on Network Interface
+
+    bandwith-usage-monitor -n interface-name
+"""
+
+import clintosaurous.log as log
+import clintosaurous.opts
+import os
+import re
+import signal
+import sys
+from time import sleep
+
+
+VERSION = '1.0.0'
+LAST_UPDATE = '2023-01-19'
+
+
+def cli_opts() -> clintosaurous.opts.argparse.Namespace:
+
+    """ Define CLI options. """
+
+    clintosaurous.opts.parser.description = \
+        'Monitor network bandwidth utilization.'
+
+    clintosaurous.opts.parser.add_argument(
+        '-n', '--interface',
+        help='Interface to monitor. If omitted best guess.',
+        type=str
+    )
+    clintosaurous.opts.parser.add_argument(
+        '-l', '--interval',
+        help='Stat display interval in seconds. Default: 5 (Minimum: 5)',
+        type=int,
+        default=5
+    )
+
+    return clintosaurous.opts.cli()
+
+
+def keyboard_interupt(signal, frame) -> None:
+
+    """ Exit On CTRL-C/KeyboardInterupt Signal """
+
+    sys.exit()
+
+
+def find_nic() -> str:
+
+    """ Attempt to Find NIC To Monitor """
+
+    log.wrn([
+        'Hey Dumbass! A little help here on which NIC?',
+        'Doing my best to think for you and guess the right NIC.',
+        "Don't hold your breath. That's all I'm saying."
+    ])
+
+    nic_list = ':' + ':'.join(os.listdir(nic_base_dir)) + ':'
+
+    for reg in ['bond', 'enx', 'wl', 'eth', 'en']:
+        match = re.search(rf':({reg}[^:]+):', nic_list)
+        if match:
+            return match.group(1)
+
+    sys.stderr.write(
+        'No suitable NIC found. Use -n | --interface to select NIC.\n')
+    sys.exit(1)
+
+
+if __name__ == '__main__':
+    signal.signal(signal.SIGINT, keyboard_interupt)
+
+    opts = cli_opts()
+
+    nic_base_dir = '/sys/class/net'
+
+    if opts.interface:
+        nic_name = opts.interface
+    else:
+        nic_name = find_nic()
+
+    if opts.interval < 5:
+        sys.stderr.write(
+            'Dude. smh. Ugh. Help says the interval must be at lease ' +
+            '5 seconds.'
+        )
+        sys.exit(1)
+
+    log.log(f'Monitoring NIC: {nic_name}')
+    log.log(f'Polling Interval: {opts.interval}')
+
+    nic_dir = f'{nic_base_dir}/{nic_name}'
+    if not os.path.exists(nic_dir):
+        sys.stderr.write(f'{nic_name} does not exist!\n')
+        sys.exit(1)
+
+    tx_bytes_file = f'{nic_dir}/statistics/tx_bytes'
+    tx_prev = 0
+
+    rx_bytes_file = f'{nic_dir}/statistics/rx_bytes'
+    rx_prev = 0
+
+    while True:
+        with open(tx_bytes_file) as tx:
+            tx_cur = int(tx.read())
+        with open(rx_bytes_file) as rx:
+            rx_cur = int(rx.read())
+
+        log.dbg([
+            f'tx_prev: {tx_prev}, tx_cur: {tx_cur}',
+            f'rx_prev: {rx_prev}, rx_cur: {rx_cur}'
+        ])
+
+        if not tx_prev or not rx_prev:
+            tx_prev = tx_cur
+            rx_prev = rx_cur
+
+        else:
+            tx_delta = tx_cur - tx_prev
+            tx_prev = tx_cur
+            tx_mb = round(tx_delta * 8 / 1000000 / opts.interval, 2)
+
+            rx_delta = rx_cur - rx_prev
+            rx_prev = rx_cur
+            rx_mb = round(rx_delta * 8 / 1000000 / opts.interval, 2)
+
+            log.dbg([
+                f'tx_delta: {tx_delta}, tx_delta: {tx_delta}',
+                f'rx_delta: {rx_delta}, rx_delta: {rx_delta}'
+            ])
+            log.log(f'{nic_name}: TX: {tx_mb} Mbs / RX: {rx_mb} Mbs')
+
+        sleep(opts.interval)

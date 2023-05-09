@@ -1,0 +1,263 @@
+---
+# Provision Common Directories and Files
+#
+# Provision common directories and files on an Ubuntu 20.04 or 22.04 server.
+#
+# Version: 1.3.2
+# Last Updated: 2023-05-09
+
+
+# General system configuration and environment file provisioning.
+- name: System Configuration and Environment Files
+  hosts: desktop:ubuntuhost
+  gather_facts: true
+  become: true
+
+  vars:
+    # List of files to be copied to all hosts.
+    copy_files:
+      - /etc/bash.bashrc
+      - /etc/default/snmpd
+      - /etc/logrotate.d/clintosaurous
+      - /etc/logrotate.d/rsyslog
+      - /etc/rsyslog.conf
+      - /etc/rsyslog.d/00-clint-default.conf
+      - /etc/ssh/sshd_config
+      - /etc/ssh/pre-login-banner.txt
+      - /etc/vim/vimrc.local
+      - /usr/bin/distro
+
+  tasks:
+    # To rsync with remote user being root, we need sudo privileges with no
+    # password. This file is removed at the end of the playbook.
+    - name: Add Temporary sudo Privileges
+      copy:
+        dest: /etc/sudoers.d/99-tmp-install
+        force: true
+        owner: root
+        group: root
+        mode: o=rw,g=r,o=
+        content: |
+          # mgmt group sudo all.
+          %mgmt     ALL=(ALL) NOPASSWD: ALL
+          mgmt-svc  ALL=(ALL) NOPASSWD: ALL
+          clint   ALL=(ALL) NOPASSWD: ALL
+
+    # Create custom logging directory.
+    - name: Clintosaurous Log Directory
+      file:
+        path: /var/log/clintosaurous
+        state: directory
+        owner: root
+        group: mgmt
+        mode: u=rwx,g=rx,o=
+
+    # Copy general files to remote host if not local host.
+    - name: Copying Files
+      copy:
+        src: "{{ item }}"
+        dest: "{{ item }}"
+        # Files will already exist. Force overwrite.
+        force: true
+      loop: "{{ copy_files }}"
+      when: "ansible_connection != 'local'"
+
+    # `distro` copy is not replicating permissions. Reset permissions.
+    - name: /usr/bin/distro Privileges
+      file:
+        path: /usr/bin/distro
+        mode: u=rwx,g=rx,o=rx
+
+    # Postfix configuration files if not localhost.
+    - name: Synchronize Postfix Files
+      synchronize:
+        src: /etc/postfix
+        dest: /etc/
+        delete: true
+        rsync_opts:
+          - "--exclude='postfix/sasl'"
+      when: "ansible_connection != 'local'"
+
+    # Update the hostname in the Postfix configuration file to remote host's
+    # name. Variable `fqdn` is defined in `group_vars/all.yaml`.
+    - name: Update Postfix Hostname
+      replace:
+        path: /etc/postfix/main.cf
+        regexp: "^myhostname.*"
+        replace: "myhostname = {{ fqdn }}"
+
+    - name: Delete Default rsyslog Configuration
+      file:
+        path: /etc/rsyslog.d/50-default.conf
+        state: absent
+
+    # Some LibreNMS agents need a cache directory.
+    - name: LibreNMS/SNMPD Cache Directory
+      file:
+        path: /var/cache/librenms
+        owner: root
+        group: Debian-snmp
+        mode: o=rwx,g=rswx,o=
+        state: directory
+
+    - name: Generate SNMPD Configuration
+      template:
+        src: j2/snmpd.conf.j2
+        dest: /etc/snmp/snmpd.conf
+        owner: root
+        group: root
+        mode: o=rw,g=r,o=
+        force: true
+
+    # Copy LibreNMS Apache2 monitoring agent script file on Apache2 servers.
+    - name: Apache2 LibreNMS Agent Script
+      copy:
+        src: /opt/librenms-agent/snmp/apache-stats.py
+        dest: /etc/snmp/apache-stats.py
+        owner: root
+        group: root
+        mode: u=rwx,g=rx,o=rx
+        force: true
+      when: "'apache2' in group_names"
+
+    # Copy LibreNMS DHCPD monitoring agent script file on DHCP servers.
+    - name: DHCPD LibreNMS Agent Script
+      block:
+        # Copy agent script.
+        - name: DHCPD Agent Script
+          copy:
+            src: /opt/librenms-agent/snmp/dhcp.py
+            dest: /etc/snmp/dhcp.py
+            owner: root
+            group: root
+            mode: u=rwx,g=rx,o=rx
+            force: true
+
+        # Generate agent configuration file.
+        - name: DHCPD Agent Script Configuration
+          copy:
+            dest: /etc/snmp/dhcp.json
+            content: '{"leasefile": "/var/lib/dhcp/dhcpd.leases" }'
+            force: true
+      when: "'ddidhcp' in group_names"
+
+    # Copy LibreNMS DNS monitoring agent script file on DNS servers.
+    - name: BIND9 LibreNMS Agent Script
+      copy:
+        src: /opt/librenms-agent/snmp/bind
+        dest: /etc/snmp/bind
+        owner: root
+        group: root
+        mode: u=rwx,g=rx,o=rx
+        force: true
+      when: "'ddidns' in group_names"
+
+    # Copy LibreNMS MySQL monitoring agent script file on MySQL servers.
+    - name: MySQL LibreNMS Agent Script
+      copy:
+        src: /opt/librenms-agent/snmp/mysql
+        dest: /etc/snmp/mysql
+        owner: root
+        group: root
+        mode: u=rwx,g=rx,o=rx
+        force: true
+      when: "'mysqlsrv' in group_names"
+
+
+# Add private certificate authority to certificate store.
+- name: Private clintosaurous.com CA
+  hosts: "desktop:ubuntuhost"
+  gather_facts: true
+  become: true
+
+  tasks:
+    # Create directory to store custom CAs.
+    - name: Intranet Certificate Directory
+      file:
+        path: /usr/share/ca-certificates/clint
+        owner: root
+        group: root
+        mode: o=rwx,g=rx,o=rx
+        state: directory
+
+    # Check if private CA exists.
+    - name: Stat Existing Certificat CA
+      stat:
+        path: /usr/share/ca-certificates/clint/clintosaurous.com.crt
+      register: cert_stat
+
+    # Create private CA file if not exists.
+    - name: Add clintosaurous.com CA Certificate
+      when: not cert_stat.stat.exists
+      copy:
+        dest: /usr/share/ca-certificates/clint/clintosaurous.com.crt
+        content: |
+          -----BEGIN CERTIFICATE-----
+          MIIEGzCCAwOgAwIBAgIUYa0G235+HBaXgkFg1gkdGWAoq9UwDQYJKoZIhvcNAQEL
+          BQAwgZwxCzAJBgNVBAYTAlVTMRAwDgYDVQQIDAdGbG9yaWRhMQ4wDAYDVQQHDAVU
+          YW1wYTEWMBQGA1UECgwNQ2xpbnRvc2F1cm91czELMAkGA1UECwwCSVQxGjAYBgNV
+          BAMMEWNsaW50b3NhdXJvdXMuY29tMSowKAYJKoZIhvcNAQkBFht3ZWJtYXN0ZXJA
+          Y2xpbnRvc2F1cm91cy5jb20wHhcNMjIwNTA3MDkwOTE3WhcNMjcwNTA2MDkwOTE3
+          WjCBnDELMAkGA1UEBhMCVVMxEDAOBgNVBAgMB0Zsb3JpZGExDjAMBgNVBAcMBVRh
+          bXBhMRYwFAYDVQQKDA1DbGludG9zYXVyb3VzMQswCQYDVQQLDAJJVDEaMBgGA1UE
+          AwwRY2xpbnRvc2F1cm91cy5jb20xKjAoBgkqhkiG9w0BCQEWG3dlYm1hc3RlckBj
+          bGludG9zYXVyb3VzLmNvbTCCASIwDQYJKoZIhvcNAQEBBQADggEPADCCAQoCggEB
+          ALsV7mZ7zrfcIXwJq91Ix3XdqClaZ7qSpg1lcTvv5xZnZFXG1QDvajrp8T4iqKQG
+          MmtpjEm8qK+MoWgtfgHQz//I9bVW0bNYmXIB0Lqa9Sk5eE8XLwVX09B5X86LqgWW
+          qvjqU70eUYP8cTbAO1LhoNHxC7VOwlyTxPoel0M8YvoyI8OgpfYRGp6I327/znZX
+          C+kPyfzgj2wt8WoDjiGdTAX1JwmC6efk2A/u44bB+YVN1e+HLkw9a2boOgKooHBT
+          5W93rIzj6qHbk3HQlwseRAIhwNhG7sHkJ2fAkPQ7f8KsUEFPOVRQZnsLjCeMeKS9
+          dnB5vu/3AhsP6ZrRglZCKGcCAwEAAaNTMFEwHQYDVR0OBBYEFOmx1IQhb7FYwa4v
+          d8zXagiaCn+VMB8GA1UdIwQYMBaAFOmx1IQhb7FYwa4vd8zXagiaCn+VMA8GA1Ud
+          EwEB/wQFMAMBAf8wDQYJKoZIhvcNAQELBQADggEBAFXGK/w0/8mc9OXRiekkqVaI
+          bdgfNbtADjHCB3H3GtLt31vDsNxgh/nYkJLqv/Al98VS2D4qvZToyXuTl6LFrNy6
+          13ddDkS6zr9IAuikxsQ0Hph1n1P6R9NHqQAsGrwkhBDIofM4u2VOYimcjJa7wQll
+          Fw7qSB9fOU3+VJzgRizpQIb48ZnM1cjVB1PetAhFcXp4r6iWBjS5r1cw3unK1yi6
+          l4Lrt7nDy6yZuG4KYkszJIaeDgTKPfN5g81DyBkI3C111Ku5tGbAKJTci8QYdVwA
+          keqxzuZ4foipW39QbxOoxbMGYttGv+mRMkhoXlki3Hr8qJdSbHG4trsx40qfA+E=
+          -----END CERTIFICATE-----
+
+    # Remove current system certifcate store if the private CA did not already
+    # exist to prepare for regenerating the store. It will not be updated if
+    # it already exists.
+    - name: Remove Existing Certificate File
+      file:
+        path: "/etc/ssl/certs/ca-certificates.crt"
+        state: absent
+      when: not cert_stat.stat.exists
+
+    # Reinstall the `ca-certificates` package to clear out all old
+    # information if CA is being added.
+    - name: Reinstall ca-certificates
+      command: "apt reinstall -y ca-certificates"
+      register: ca_reinstall
+      when: not cert_stat.stat.exists
+
+    # Update the certificate store if CA is being added.
+    - name: Update CA Repo
+      command: update-ca-certificates
+      register: ca_update
+      changed_when: "'0 added, 0 removed' not in ca_update.stdout"
+      failed_when: "ca_update.stderr"
+      when: not cert_stat.stat.exists
+
+    # The Python module `certifi` has its own certificate store that also
+    # needs to have the private CA added to. Check if `certifi` is installed.
+    - name: Stat VENV certifi
+      stat:
+        path: "/opt/clintosaurous/venv/lib/python3.{{ '8' if ansible_distribution_major_version == '20' else '10' }}/site-packages/certifi"
+      register: certifi_stat
+
+    # Update Python `certifi` module certificate store if installed.
+    - name: Copy Update CA Certificats to certifi
+      copy:
+        src: /etc/ssl/certs/ca-certificates.crt
+        dest: "{{ certifi_stat.stat.path }}/cacert.pem"
+        remote_src: true
+      when: certifi_stat.stat.exists
+
+    # Remove the temporary sudo no password privileges.
+    - name: Remove Temporary sudo Privileges
+      file:
+        path: /etc/sudoers.d/99-tmp-install
+        state: absent

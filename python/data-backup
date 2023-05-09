@@ -1,0 +1,237 @@
+#!/opt/clintosaurous/venv/bin/python3 -Bu
+
+"""
+This script audits various aspects of Clint's home network environment. It is
+intended for Ubuntu systems.
+
+Use -h to see available command line options.
+"""
+
+
+from clintosaurous.datetime import run_time
+from clintosaurous.file import datestamp, lock
+import clintosaurous.log as log
+import clintosaurous.opts
+import getpass
+from glob import glob
+import os
+import shutil
+import sys
+import yaml
+
+
+VERSION = '6.1.5'
+LAST_UPDATE = '2022-12-30'
+
+
+def cli_opts() -> clintosaurous.opts.argparse.Namespace:
+
+    clintosaurous.opts.parser.description = """
+        This script audits various aspects of Clint's home network
+        environment. It is intended for Ubuntu systems.
+    """
+
+    clintosaurous.opts.parser.add_argument(
+        '-C', '--backup-config',
+        help="""
+            Path to configuration file.
+            Default: /etc/clintosaurous/data-backup.yaml
+        """,
+        type=str,
+        default='/etc/clintosaurous/data-backup.yaml'
+    )
+
+    return clintosaurous.opts.cli()
+
+# End: cli_opts()
+
+
+def conf_defaults(conf: dict):
+
+    # Type hints.
+    if not isinstance(conf, dict):
+        raise TypeError(f'conf expected `str`, received {type(conf)}')
+
+    defaults = {
+        "options": {"mysql": False, "plex": False},
+        "paths": [],
+        "home": [],
+        "bak_files": []
+    }
+
+    for key1 in defaults.keys():
+        try:
+            conf[key1]
+        except KeyError:
+            conf[key1] = defaults[key1]
+            continue
+
+        if not isinstance(defaults[key1], dict):
+            continue
+
+        for key2 in defaults[key1].keys():
+            try:
+                conf[key1][key2]
+            except KeyError:
+                conf[key1][key2] = defaults[key1][key2]
+
+# End: conf_defaults()
+
+
+if __name__ == '__main__':
+    opts = cli_opts()
+
+    if getpass.getuser() != 'root':
+        print(
+            'You must be logged in as root to run this script!',
+            file=sys.stderr
+        )
+        sys.exit(1)
+
+    log.log('Starting backup process')
+
+    log.log(f'Reading configuration file: {opts.backup_config}')
+    with open(opts.backup_config, newline='') as c:
+        conf = yaml.safe_load(c)
+
+    conf_defaults(conf)
+    lock()
+    os.chdir('/')
+
+    bkup_dir = conf["options"]["backup_dir"]
+    if not os.path.exists(bkup_dir):
+        log.log('Creating base backup directory')
+        os.mkdir(bkup_dir, 0o2770)
+
+    bkup_name = f'backup.{datestamp()}'
+    bkup_file_name = f'{bkup_name}.tar.gz'
+    bkup_file = os.path.join(bkup_dir, bkup_file_name)
+    log.log(f'Backup file: {bkup_file}')
+
+    tar_list = []
+    for path in conf["paths"]:
+        for bkup_path in glob(path):
+            tar_list.append(bkup_path)
+
+    log.log('Processing home directories')
+    for user in os.listdir('/home'):
+        homedir = os.path.join('/home', user)
+        for dir_name in conf["home"]:
+            dir_path = os.path.join(homedir, dir_name)
+            if os.path.exists(dir_path):
+                tar_list.append(dir_path)
+
+    for file in conf["bak_files"]:
+        bak_file = f'{file}.bak'
+        shutil.copyfile(file, bak_file)
+        tar_list.append(bak_file)
+
+    if os.path.exists(bkup_file):
+        log.log('Removing existing backup file')
+        os.remove(bkup_file)
+
+    log.log('Creating backup file')
+    cmd = (
+        f"tar --transform='flags=r;s/^/backup.{datestamp()}\\//' " +
+        "--hard-dereference " +
+        f"-cvzf '{bkup_file}' '" + "' '".join(sorted(tar_list)) + "' 2>&1"
+    )
+    log.dbg(f'cmd: {cmd}')
+    for line in os.popen(cmd).read().split('\n'):
+        log.inf(line)
+
+    if conf["options"]["mysql"]:
+        mysql_bkup_dir = os.path.join(bkup_dir, 'mysql')
+        if not os.path.exists(mysql_bkup_dir):
+            log.log('Creating base MySQL backup directory')
+            os.mkdir(mysql_bkup_dir, 0o2770)
+        mysql_bkup_file = f'mysql-{bkup_name}.sql.gz'
+        mysql_bkup_path = os.path.join(mysql_bkup_dir, mysql_bkup_file)
+        log.log('Backing up MySQL databases')
+        log.log(f'MySQL backup file: {mysql_bkup_path}')
+        cmd = (
+            '/usr/bin/mysqldump ' +
+            '--all-databases --add-drop-database --source-data ' +
+            f' | gzip > {mysql_bkup_path}'
+        )
+        log.dbg(f'cmd: {cmd}')
+        for line in os.popen(cmd).read().split('\n'):
+            log.inf(line)
+
+        log.log('Deleting MySQL backups older than 1 week')
+        cmd = (
+            f'find {mysql_bkup_dir} -daystart -maxdepth 1 -mtime +7 ' +
+            '-type f -print -delete -name "mysql-backup.*"'
+        )
+        log.dbg(f'cmd: {cmd}')
+        for line in os.popen(cmd).read().split('\n'):
+            log.inf(line)
+
+    if conf["options"]["plex"]:
+        plex_dir = '/var/lib/plexmediaserver'
+        os.chdir(plex_dir)
+        plex_bkup_dir = os.path.join(bkup_dir, 'plex')
+        if not os.path.exists(plex_bkup_dir):
+            log.log('Creating base Plex backup directory')
+            os.mkdir(plex_bkup_dir, 0o2770)
+        plex_bkup_file = f'plex-{bkup_name}.tar.gz'
+        plex_bkup_path = os.path.join(plex_bkup_dir, plex_bkup_file)
+
+        log.log('Deleting any existing Plex backups for today')
+        cmd = f'rm -f {plex_bkup_path}*'
+        log.dbg(f'cmd: {cmd}')
+        for line in os.popen(cmd).read().split('\n'):
+            log.inf(line)
+
+        log.log('Backing up Plex metadata')
+        log.log(f'Plex backup file: {plex_bkup_path}')
+        cmd = f"tar -czvf '{plex_bkup_path}' Library"
+        log.dbg(f'cmd: {cmd}')
+        for line in os.popen(cmd).read().split('\n'):
+            log.inf(line)
+
+        # The backup file is split into 500MB chuncks to avoid rsync errors.
+        os.chdir(plex_bkup_dir)
+        log.log('Splitting Plex backup into multiple files')
+        cmd = f'split -d -b 500M {plex_bkup_file} {plex_bkup_file}.part'
+        log.dbg(f'cmd: {cmd}')
+        for line in os.popen(cmd).read().split('\n'):
+            log.inf(line)
+
+        log.log(f'Deleting original Plex backup file')
+        cmd = f'rm -f {plex_bkup_path}'
+        log.dbg(f'cmd: {cmd}')
+        for line in os.popen(cmd).read().split('\n'):
+            log.inf(line)
+
+        log.log('Deleting Plex metadata backups older than 3 days')
+        cmd = (
+            f'find {plex_bkup_dir} -daystart -maxdepth 1 -mtime +3 ' +
+            '-type f -print -delete -name "plex-backup*"'
+        )
+        for line in os.popen(cmd).read().split('\n'):
+            log.inf(line)
+
+    log.log('Deleting backups older than 2 week')
+    cmd = (
+        f'find {bkup_dir} -daystart -maxdepth 1 -mtime +14 -type f ' +
+        '-print -delete -name "backup.*"'
+    )
+    log.dbg(f'cmd: {cmd}')
+    for line in os.popen(cmd).read().split('\n'):
+        log.inf(line)
+
+    log.log(f'Resetting file ownership for {bkup_dir}')
+    cmd = f'chown -cR clint:clint {bkup_dir} 2>&1'
+    log.dbg(f'cmd: {cmd}')
+    for line in os.popen(cmd).read().split('\n'):
+        log.inf(line)
+
+    log.log(f'Resetting file permissions for {bkup_dir}')
+    cmd = f'chmod -cR g+w,o= {bkup_dir} 2>&1'
+    log.dbg(f'cmd: {cmd}')
+    for line in os.popen(cmd).read().split('\n'):
+        log.inf(line)
+
+    log.log('Backup complete')
+    log.log(f'Run time: {run_time()}')

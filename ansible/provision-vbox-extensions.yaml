@@ -1,0 +1,50 @@
+---
+# Provision VirtualBox Guest Additions on VMs
+#
+# Provision VirtualBox guest additions on Ubuntu 20.04 or 22.04 virtual
+# machines.
+#
+# Version: 1.1.2
+# Last Updated: 2023-05-09
+
+
+- name: Provision VirtualBox Guest Additions
+  hosts: vmhosthost
+  gather_facts: false
+  become: true
+
+  tasks:
+    # Query the status of host services to check if the VirtualBox additions
+    # are already installed.
+    - name: Query Service States
+      service_facts:
+      register: service_facts
+
+    - name: Set services_list Shortcut Variable
+      set_fact:
+        services_list: "{{ service_facts.ansible_facts.services }}"
+
+    # Copy the VirtualBox additions installation file to remote host.
+    - name: Copy VBoxLinuxAdditions.run
+      copy:
+        src: /data/software/VBoxLinuxAdditions.run
+        dest: /var/tmp/VBoxLinuxAdditions.run
+      when: "'vboxadd-service.service' not in services_list"
+
+    - name: Set VBoxLinuxAdditions.run Permissions
+      file:
+        path: "/var/tmp/VBoxLinuxAdditions.run"
+        mode: "0755"
+      when: "'vboxadd-service.service' not in services_list"
+
+    - name: Install Guest Additions
+      shell:
+        cmd: "/var/tmp/VBoxLinuxAdditions.run --accept"
+      register: vbox_install
+      failed_when: "'kernel modules will not be replaced until' not in vbox_install.stdout"
+      when: "'vboxadd-service.service' not in services_list"
+
+    - name: Remove VBoxLinuxAdditions.run
+      file:
+        path: /var/tmp/VBoxLinuxAdditions.run
+        state: absent

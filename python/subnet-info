@@ -1,0 +1,40 @@
+#!/opt/clintosaurous/venv/bin/python3 -Bu
+
+"""
+Displays information about the supplied subnet.
+"""
+
+
+import clintosaurous.opts
+import ipaddress
+import sys
+
+
+VERSION = '3.1.2'
+LAST_UPDATE = '2023-01-09'
+
+
+if __name__ == '__main__':
+    clintosaurous.opts.parser.description = \
+        'Displays information about the supplied subnet.'
+
+    opts, args = clintosaurous.opts.cli(known=True)
+    ip_int = ipaddress.ip_interface(args[0])
+    network = ip_int.network
+
+    print("\n{} -\n".format(str(ip_int)))
+    print("    Network:      {}".format(network.network_address))
+
+    if network.version == 4:
+        print("    Subnet Mask:  {}".format(network.netmask))
+
+    ptr = ipaddress.ip_address(network.network_address).reverse_pointer
+    print(f'    Bit Mask:     {network.prefixlen}')
+    print(f'    Broadcast:    {network.broadcast_address}')
+    print(f'    Addresses:    {network.num_addresses:,}')
+    print(f'    PTR:          {ptr}')
+
+    if network.version == 4:
+        print("    Host Mask:    {}".format(network.hostmask))
+
+    print()

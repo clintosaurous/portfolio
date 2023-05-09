@@ -1,0 +1,1478 @@
+#!/opt/clintosaurous/venv/bin/python3 -Bu
+
+"""
+Queries the syslog and firewall databases and reports on firewall messages
+and generates reports that are imported into the reports database.
+"""
+
+
+import clintosaurous.credentials
+from clintosaurous.datetime import datestamp, run_time
+import clintosaurous.db
+import clintosaurous.log as log
+import clintosaurous.opts
+from clintosaurous.text import pluralize
+import dns.resolver as pyresolv
+import ipaddress
+import json
+import re
+import os
+import time
+
+
+
+
+VERSION = '2.8.4'
+LAST_UPDATE = '2023-01-17'
+
+
+def cli_opts() -> clintosaurous.opts.argparse.Namespace:
+
+    """
+    Define CLI options.
+    """
+
+    clintosaurous.opts.parser.description = """
+        Queries the syslog and firewall databases and reports on firewall
+        messages and generates reports that are imported into the reports
+        database.
+    """
+
+    clintosaurous.opts.parser.add_argument(
+        '-a', '--date',
+        type=str,
+        default=datestamp(time.time() - 86400),
+        help='Date to run report for. Default is previous day.'
+    )
+
+    return clintosaurous.opts.cli()
+
+
+def cleanup_db(db: clintosaurous.db.connect) -> None:
+
+    """
+    Clean up report data older than 30 days.
+    """
+
+    # Type hints.
+    if not isinstance(db, clintosaurous.db.connect):
+        raise TypeError('db type must be clintosaurous.db.connect')
+
+    age_out = 30
+
+    for table in ['firewall_host_pairs', 'firewall_protocol_summary']:
+        log.log(
+            f'Deleting report data older than {age_out} ' +
+            f'days from table {table}'
+        )
+        sql = (
+            f'delete from {table} where ' +
+            f'datediff(curdate(), datestamp) > {age_out}'
+        )
+        log.dbg(sql)
+        cursor = db.cursor()
+        row_cnt = cursor.execute(sql)
+        if row_cnt < 0:
+            row_cnt = 0
+        log.log(f'{row_cnt} records deleted')
+        cursor.close()
+        db.commit()
+
+    for table in [
+        'firewall_doh_counts', 'firewall_messages', 'firewall_vpn_messages'
+    ]:
+        log.log(
+            f'Deleting report data older than {age_out} ' +
+            f'days from table {table}'
+        )
+        sql = (
+            f'delete from {table} where ' +
+            f'datediff(curdate(), timestamp) > {age_out}'
+        )
+        log.dbg(f'cleanup_db(): sql:\n{sql}')
+        cursor = db.cursor()
+        cursor.execute(sql)
+        row_cnt = cursor.rowcount
+        if row_cnt < 0:
+            row_cnt = 0
+        log.log(f'{row_cnt} records deleted')
+        cursor.close()
+        db.commit()
+
+
+def find_hostname(ip: str) -> str:
+
+    """
+    Lookup the DNS hostname for given IP address.
+    """
+
+    # Type hints.
+    if not isinstance(db, clintosaurous.db.connect):
+        raise TypeError('db type must be clintosaurous.db.connect')
+
+    log.dbg(f'find_hostname(): ip: {ip}')
+
+    try:
+        return dns_queries[ip]
+
+    except KeyError:
+        dns_queries[ip] = nslookup(ip)
+
+    log.dbg(f'find_hostname(): dns_queries[{ip}]: {dns_queries[ip]}')
+    json_write(nslookup_file, dns_queries, logging=False)
+    return dns_queries[ip]
+
+
+def json_read(file: str) -> None:
+
+    """
+    Load JSON formatted file. This will get deleted on host reboot.
+    """
+
+    # Type hints.
+    if not isinstance(file, str):
+        raise TypeError('file type must be str')
+
+    data = {}
+
+    if os.path.exists(file):
+        log.log(f'Reading JSON file {file}')
+        with open(file) as f:
+            data = json.load(f)
+            log.log(f'{len(data.keys())} rows loaded')
+
+    return data
+
+
+def json_write(file: str, data: None, logging: bool = True):
+
+    """
+    Write structure to JSON formatted file.
+    """
+
+    # Type hints.
+    if not isinstance(file, str):
+        raise TypeError('file type must be str')
+    if not isinstance(logging, bool):
+        raise TypeError('logging type must be bool')
+
+    if logging:
+        log.log(f'Writing {file}')
+    with open(file, 'w') as f:
+        json.dump(data, f)
+
+
+def nslookup(dns_request: str, attempt: int = 0) -> str:
+
+    """
+    Performs a DNS lookup for the request.
+    """
+
+    # Type hints.
+    if not isinstance(dns_request, str):
+        raise TypeError('dns_request type must be str')
+
+    arpa = ipaddress.ip_address(dns_request).reverse_pointer
+    try:
+        return [
+            re.sub(r'\.+$', '', str(r))
+            for r in pyresolv.resolve(arpa, 'PTR')
+        ][0]
+    except (
+        pyresolv.LifetimeTimeout, pyresolv.NoNameservers, pyresolv.NXDOMAIN
+    ):
+        if attempt:
+            log.dbg(f'DNS lookup for {dns_request} failed')
+            return None
+        log.dbg(f'DNS lookup retry for {dns_request}')
+        nslookup(dns_request, 1)
+
+
+def parse_msgs_fw(
+    pfsense_ints: dict, pfsense_rules: dict, msgs: list
+) -> list:
+
+    """
+    Parse database firewall messages data.
+    """
+
+    # Type hints.
+    if not isinstance(pfsense_ints, dict):
+        raise TypeError('pfsense_ints type must be dict')
+    if not isinstance(pfsense_rules, dict):
+        raise TypeError('pfsense_rules type must be dict')
+    if not isinstance(msgs, list):
+        raise TypeError('msgs type must be list')
+
+    log.log('Parsing firewall syslog messages')
+
+    parsed_msgs = []
+    pfsense_cnt = 0
+    ufw_cnt = 0
+    unknown_cnt = 0
+
+    for msg in msgs:
+        msg_data = {}
+
+        if msg["vendor"] == 'pfSense':
+            pfsense_cnt = pfsense_cnt + 1
+            msg_data = parse_msg_fw_pfsense(pfsense_ints, pfsense_rules, msg)
+
+        elif msg["vendor"] == 'UFW':
+            ufw_cnt = ufw_cnt + 1
+            msg_data = parse_msg_fw_ufw(msg)
+
+        else:
+            unknown_cnt = unknown_cnt + 1
+            log.wrn("Unknown vendor for message '" + msg["msg"] + "'")
+            continue
+
+        try:
+            msg_data["src_port"] = \
+                services[msg_data["src_port"]][msg_data["protocol"]]
+        except KeyError:
+            msg_data["src_port"]
+
+        try:
+            msg_data["dst_port"] = \
+                services[msg_data["dst_port"]][msg_data["protocol"]]
+        except KeyError:
+            msg_data["dst_port"]
+
+        msg_data["hostname"] = msg["hostname"]
+        msg_data["timestamp"] = msg["timestamp"]
+
+        parsed_msgs.append(msg_data)
+
+    log.log(
+        f'{pfsense_cnt:,} pfSense ' +
+        f'{pluralize("message", pfsense_cnt)} processed.'
+    )
+    log.log(
+        f'{ufw_cnt:,} UFW ' +
+        f'{pluralize("message", ufw_cnt)} processed.'
+    )
+    log.log(
+        f'{unknown_cnt:,} unknown vendor ' +
+        f'{pluralize("message", unknown_cnt)} found.'
+    )
+
+    return parsed_msgs
+
+
+def parse_msg_fw_pfsense(ints: dict, rules: dict, msg: dict) -> dict:
+
+    """
+    Parse pfSense firewall message.
+    """
+
+    # Type hints.
+    if not isinstance(pfsense_ints, dict):
+        raise TypeError('pfsense_ints type must be dict')
+    if not isinstance(pfsense_rules, dict):
+        raise TypeError('pfsense_rules type must be dict')
+    if not isinstance(msg, dict):
+        raise TypeError('msg type must be dict')
+
+    # Log format can be found at:
+    #   https://docs.netgate.com/pfsense/en/latest/monitoring/\
+    #       filter-log-format-for-pfsense-2-2.html
+    # 0 1 2 3          4    5     6     7  8 9   10 11 12    13 14 15
+    # 5, , ,1000000103,vmx5,match,block,in,4,0x0,  ,64,47080,0, DF,17, \
+    #   16  17  18          19         20    21  22
+    #   udp,170,172.16.4.16,172.16.0.5,41842,514,150
+
+    # 0 1 2 3          4    5     6     7  8 9    10 11 12    13 14
+    # 5, , ,1000000103,vmx4,match,block,in,4,0xc0,  ,1 ,62285,0 ,none, \
+    #   15 16    17 18         19         20
+    #   88,eigrp,60,10.0.0.135,224.0.0.10,datalength=40
+
+    # 0 1 2 3          4    5     6     7  8 9   10 11  12   13 14 15
+    # 5, , ,1000000103,vmx5,match,block,in,4,0x0,  ,255,5356,0 ,DF,17,
+    #   16  17  18          19          20   21   22
+    #   udp,277,172.16.4.16,224.0.0.251,5353,5353,257
+
+    # 0 1 2 3          4    5     6     7  8 9    10      11 12      13
+    # 7, , ,1000000105,vmx5,match,block,in,6,0x00,0x00000,1 ,Options,0, \
+    #   14 15                       16       17  18      19     20
+    #   56,fe80::20c:29ff:fe87:467f,ff02::16,HBH,RTALERT,0x0000,PADN,
+
+    fields = msg["msg"].split(',')
+    fields[16] = fields[16].upper()
+    try:
+        int_name = ints[fields[4]]
+    except KeyError:
+        int_name = fields[4]
+    msg_data = {
+        "interface": int_name,
+        "dst_ip": None,
+        "dst_port": None,
+        "protocol": None,
+        "src_ip": None,
+        "src_port": None,
+        "rule": None,
+        "rule_type": fields[6]
+    }
+
+    if isinstance(fields[3], str):
+        fields[3] = int(fields[3])
+
+    try:
+        msg_data["rule"] = rules[msg["hostname"]][fields[3]]["descr"]
+    except (IndexError, KeyError):
+        msg_data["rule"] = f'Unknown {fields[3]}'
+
+    if fields[16] == 'CARP':
+
+        # 0  1 2 3          4    5     6     7  8 9    10 11  12 13 14 15
+        # 53, , ,1000000201,vmx7,match,block,in,4,0xe0,  ,255,0 ,0 ,DF,112,
+        #   16   17 18         19         20        21  22 23 24 25
+        #   carp,56,172.16.4.2,224.0.0.18,advertise,255,4 ,2 ,0 ,1
+
+        src_ip = ipaddress.ip_address(fields[18].lower())
+        dst_ip = ipaddress.ip_address(fields[19].lower())
+
+        msg_data["protocol"] = "VRRP"
+        msg_data["src_ip"] = src_ip.compressed
+        msg_data["dst_ip"] = dst_ip.compressed
+        msg_data["src_port"] = None
+        msg_data["dst_port"] = fields[20]
+
+    elif fields[16] == 'ICMP':
+
+        # 0 1 2 3          4    5     6     7  8 9    10 11 12    13 14   15
+        # 5, , ,1000000103,vmx6,match,block,in,4,0xd0,  ,64,24046,0 ,none,1,
+        #   16   17  18           19         20          21           22
+        #   icmp,356,172.16.2.202,172.16.2.3,unreachport,172.16.2.202,UDP,
+        #   23
+        #   68336
+
+        src_ip = ipaddress.ip_address(fields[18].lower())
+        dst_ip = ipaddress.ip_address(fields[19].lower())
+
+        msg_data["protocol"] = "ICMP"
+        msg_data["src_ip"] = src_ip.compressed
+        msg_data["dst_ip"] = dst_ip.compressed
+        msg_data["src_port"] = None
+        msg_data["dst_port"] = fields[20]
+
+    elif fields[12] == 'ICMPv6':
+
+        # 0 1 2 3          4    5     6     7  8 9    10      11  12     13
+        # 7, , ,1000000105,vmx0,match,block,in,6,0x00,0x615d4,105,ICMPv6,58,
+        #   14 15                     16
+        #   64,2607:f8b0:4002:c02::64,2603:9000:f302:19c1::252,
+
+        src_ip = ipaddress.ip_address(fields[15].lower())
+        dst_ip = ipaddress.ip_address(fields[16].lower())
+
+        msg_data["protocol"] = "ICMPv6"
+        msg_data["src_ip"] = src_ip.compressed
+        msg_data["dst_ip"] = dst_ip.compressed
+        msg_data["src_port"] = None
+        msg_data["dst_port"] = None
+
+    elif fields[16] == 'IGMP':
+
+        # 0 1 2 3          4    5     6     7  8 9    10 11 12 13 14 15 16
+        # 5, , ,1000000103,vmx7,match,block,in,4,0xc0,  ,1, 0, 0, DF,2, igmp,
+        #   17 18             19         20
+        #   40,172.29.243.225,224.0.0.22,datalength=16
+
+        src_ip = ipaddress.ip_address(fields[18].lower())
+        dst_ip = ipaddress.ip_address(fields[19].lower())
+
+        msg_data["protocol"] = "IGMP"
+        msg_data["src_ip"] = src_ip.compressed
+        msg_data["dst_ip"] = dst_ip.compressed
+        msg_data["src_port"] = None
+        msg_data["dst_port"] = None
+
+    elif fields[12] == 'VRRP':
+
+        # 0     1   2   3           4       5        6        7     8
+        # '52', '', '', 1000000201, 'vmx1', 'match', 'block', 'in', '6',
+        # 9       10         11     12      13     14
+        # '0xe0', '0x00000', '255', 'VRRP', '112', '36',
+        # 15                          16          17
+        # 'fe80::20c:29ff:fe24:6c64', 'FF02::12', ''
+
+        src_ip = ipaddress.ip_address(fields[15].lower())
+        dst_ip = ipaddress.ip_address(fields[16].lower())
+
+        msg_data["protocol"] = "VRRP"
+        msg_data["src_ip"] = src_ip.compressed
+        msg_data["dst_ip"] = dst_ip.compressed
+        msg_data["src_port"] = None
+        msg_data["dst_port"] = None
+
+    elif fields[16] == 'PFSYNC':
+
+        # 0 1 2 3          4    5     6     7  8  9    10 11  12 13 14 15
+        # 5, , ,1000000103,vmx2,match,block,in,4 ,0x10,  ,255,0 ,0 ,DF,240,
+        #   16     17  18            19          20
+        #   pfsync,132,10.10.255.2,224.0.0.240,datalength=112
+
+        src_ip = ipaddress.ip_address(fields[18].lower())
+        dst_ip = ipaddress.ip_address(fields[19].lower())
+
+        msg_data["protocol"] = "PFSYNC"
+        msg_data["src_ip"] = src_ip.compressed
+        msg_data["dst_ip"] = dst_ip.compressed
+        msg_data["src_port"] = None
+        msg_data["dst_port"] = None
+
+    else:
+        try:
+            ip_addr = ipaddress.ip_address(fields[15])
+
+        except ValueError as e:
+            try:
+                src_port = int(fields[20])
+            except ValueError:
+                src_port = fields[20]
+
+            try:
+                dst_port = int(fields[21])
+            except ValueError:
+                dst_port = fields[21]
+
+            if isinstance(fields[20], str):
+                fields[20] = int(fields[20])
+            if isinstance(fields[21], str):
+                fields[21] = int(fields[21])
+
+            src_ip = ipaddress.ip_address(fields[18].lower())
+            dst_ip = ipaddress.ip_address(fields[19].lower())
+
+            msg_data["protocol"] = fields[16].upper()
+            msg_data["src_ip"] = src_ip.compressed
+            msg_data["dst_ip"] = dst_ip.compressed
+            msg_data["src_port"] = src_port
+            msg_data["dst_port"] = dst_port
+
+        else:
+            if ip_addr.version == 4:
+                src_ip = ipaddress.ip_address(fields[15].lower())
+                dst_ip = ipaddress.ip_address(fields[16].lower())
+
+                msg_data["protocol"] = fields[17].upper()
+                msg_data["src_ip"] = src_ip.compressed
+                msg_data["dst_ip"] = dst_ip.compressed
+                msg_data["src_port"] = fields[18]
+                msg_data["dst_port"] = fields[19]
+
+            else:
+
+                # 0 1 2 3          4    5     6     7  8 9    10      11 12
+                # 7, , ,1000000105,vmx5,match,block,in,6,0x00,0xfb671,64,TCP,
+                #   13 14 15
+                #   6, 40,fc00:4::20c:29ff:fe8f:8f30,
+                #   16                          17 18    19 20 21
+                #   fc00:10::1599:c54:d1d1:7dc6,22,56000,0 ,SA,2853982414,
+                #   22         23    24 25
+                #   1134922095,64260,  ,mss;sackOK;TS;nop;wscale
+
+                # 0 1 2 3          4    5     6     7  8 9    10      11 12
+                # 7, , ,1000000105,vmx5,match,block,in,6,0x00,0x524fe,64,UDP,
+                #   12 14 15                         16             17
+                #   17,36,fc00:4::20c:29ff:fe77:35be,2001:500:2d::d,56789,
+                #   18 19
+                #   53,36
+
+                src_ip = ipaddress.ip_address(fields[15].lower())
+                dst_ip = ipaddress.ip_address(fields[16].lower())
+
+                msg_data["protocol"] = fields[12].upper()
+                msg_data["src_ip"] = src_ip.compressed
+                msg_data["dst_ip"] = dst_ip.compressed
+                msg_data["src_port"] = fields[17]
+                msg_data["dst_port"] = fields[18]
+
+    return msg_data
+
+
+def parse_msg_fw_ufw(msg: dict) -> dict:
+
+    """
+    Parse UFW firewall message.
+    """
+
+    # Type hints.
+    if not isinstance(msg, dict):
+        raise TypeError('msg type must be dict')
+
+    # UFW
+
+    # [276647.968036] [UFW BLOCK] IN=ens160 OUT= \
+    #   MAC=01:00:5e:00:00:fb:f4:8c:eb:c2:c0:8a:08:00 \
+    #   SRC=172.16.0.1 DST=224.0.0.251 LEN=36 TOS=0x00 PREC=0xC0 \
+    #   TTL=1 ID=0 DF PROTO=2
+
+    # [267094.604081] [UFW BLOCK] IN=pnet0 OUT= \
+    #   MAC=00:0c:29:ef:92:3d:00:0c:29:dd:30:76:08:00 \
+    #   SRC=172.16.0.8 DST=172.16.0.238 LEN=60 TOS=0x00 \
+    #   PREC=0x00 TTL=64 ID=35638 DF \
+    #   PROTO=TCP SPT=936 DPT=40191 WINDOW=64240 RES=0x00 SYN URGP=0
+
+    # [378349.500417] [UFW BLOCK] IN=tun0 OUT= MAC= \
+    #   SRC=10.170.0.1 DST=10.170.0.62 LEN=52 TOS=0x00 \
+    #   PREC=0x00 TTL=64 ID=49035 DF \
+    #   PROTO=TCP SPT=8090 DPT=33298 WINDOW=501 RES=0x00 ACK URGP=0
+
+    # firewalld
+
+    # [560557.172789] FINAL_REJECT: IN=ens192 OUT= \
+    #   MAC=01:00:5e:00:00:12:00:0c:29:6b:1e:f8:08:00 \
+    #   SRC=172.16.0.16 DST=224.0.0.18 LEN=40 TOS=0x00 \
+    #   PREC=0xC0 TTL=255 ID=408 PROTO=112
+
+    msg_data = {
+        "interface":    None,
+        "dst_ip":       None,
+        "dst_port":     None,
+        "protocol":     None,
+        "src_ip":       None,
+        "src_port":     None,
+        "rule":         None,
+        "rule_type":    "block"
+    }
+
+    # Check if pass message, we default `rule_type` to 'block'.
+    match = re.search(r'\[UFW\s+([A-Z])\]', msg["msg"])
+    if match and match.group(1) == 'ALLOW':
+        msg_data["rule_type"] = 'pass'
+
+    fields = msg["msg"].replace("[", "").replace("]", "").strip().split(" ")
+    for field in fields:
+        split_field = field.split("=")
+        try:
+            split_field[1]
+        except IndexError:
+            continue
+
+        if split_field[0] == "IN":
+            msg_data["interface"] = split_field[1]
+        elif split_field[0] == "SRC":
+            src_ip = ipaddress.ip_address(split_field[1].lower())
+            msg_data["src_ip"] = src_ip.compressed
+        elif split_field[0] == "DST":
+            dst_ip = ipaddress.ip_address(split_field[1].lower())
+            msg_data["dst_ip"] = dst_ip.compressed
+        elif split_field[0] == "SPT":
+            if isinstance(split_field[1], str):
+                split_field[1] = int(split_field[1])
+            msg_data["src_port"] = split_field[1]
+        elif split_field[0] == "DPT":
+            if isinstance(split_field[1], str):
+                split_field[1] = int(split_field[1])
+            msg_data["dst_port"] = split_field[1]
+        elif split_field[0] == "PROTO":
+            msg_data["protocol"] = split_field[1]
+
+    return msg_data
+
+
+def parse_msgs_vpn(msgs: list) -> list:
+
+    """
+    Parse VPN connection messages.
+    """
+
+    # Type hints.
+    if not isinstance(msgs, list):
+        raise TypeError('msgs type must be list')
+
+    log.log('Parsing VPN syslog messages')
+
+    auth_user = '<None>'
+    connect_user = None
+    peer_ip = None
+    parsed_msgs = []
+
+    for msg in msgs:
+
+        # 172.58.169.163:47337 [cmymciyqeb] Peer Connection Initiated with \
+        #   [AF_INET]172.58.169.163:47337
+        if re.search(r'Peer Connection', msg["msg"]):
+            match = re.search(r'^([^:]+):\d+\s+\[([^\]]+)\]', msg["msg"])
+            if not match or not match.group(1):
+                log.wrn(
+                    'Could not parse VPN peer information on ' +
+                    f'{msg["hostname"]} from line: {msg["msg"]}'
+                )
+                continue
+
+            peer_ip = match.group(1)
+            connect_user = match.group(2)
+
+            if not auth_user:
+                log.wrn(
+                    f'New connection on {msg["hostname"]} from ' +
+                    f'{peer_ip}/{connect_user} without ' +
+                    "authentication request from previous connection!"
+                )
+
+            msg_data = msg
+            msg_data["msg_type"] = "Connect"
+            msg_data["src_ip"] = peer_ip
+            msg_data["user"] = connect_user
+            msg_data["status"] = None
+            parsed_msgs.append(msg_data)
+
+        # user 'cmymciyqeb' authenticated
+        # user 'cmymciyqeb' could not authenticate.
+        elif re.search(r'^user', msg["msg"]):
+            match = re.search(r'^user\s+\'([^\']+)\'\s+([^\.]+)', msg["msg"])
+            if not match or not match.group(1):
+                log.wrn(
+                    'Could not parse VPN user information from line: ' +
+                    msg["msg"]
+                )
+                continue
+
+            auth_user = match.group(1)
+            status = match.group(2)
+
+            if not connect_user:
+                log.wrn(
+                    f'VPN authentication user {auth_user} ' +
+                    'without connect user!'
+                )
+
+            elif auth_user != connect_user:
+                log.wrn(
+                    f'VPN authentication user {auth_user} ' +
+                    f'does not match connect user {connect_user}!'
+                )
+
+            msg_data = msg
+            msg_data["msg_type"] = 'Authentication'
+            msg_data["src_ip"] = peer_ip
+            msg_data["user"] = auth_user
+            msg_data["status"] = status
+            parsed_msgs.append(msg_data)
+
+    msg_cnt = len(parsed_msgs)
+    log.log(
+        f'{msg_cnt:,} VPN ' +
+        f'{pluralize("message", msg_cnt)} parsed.'
+    )
+
+    return parsed_msgs
+
+
+def process_msgs_fw(services: dict, parsed_msgs: list) -> dict:
+
+    """
+    Process parsed firewall messages.
+    """
+
+    # Type hints.
+    if not isinstance(services, dict):
+        raise TypeError('services type must be dict')
+    if not isinstance(parsed_msgs, list):
+        raise TypeError('parsed_msgs type must be list')
+
+    log.log('Processing parsed firewall messages')
+
+    start_time = time.time()
+
+    proto_trans = {"2": 'IGMP', "112": 'VRRP'}
+
+    processed_msgs = {
+        "doh_msgs": [],
+        "dst_ip_cnts": {"block": {}, "pass": {}},
+        "dst_port_cnts": {"block": {}, "pass": {}},
+        "host_pairs": {"block": {}, "pass": {}},
+        "msgs": parsed_msgs,
+        "protocol_cnts": {"block": {}, "pass": {}},
+        "src_ip_cnts": {"block": {}, "pass": {}},
+        "src_port_cnts": {"block": {}, "pass": {}},
+        "total_msgs": {"block": 0, "pass": 0}
+    }
+
+    msg_cnt = 0
+    log_interval = 1000
+    if opts.log_info:
+        print(f'. = {log_interval} processed')
+
+    for msg in parsed_msgs:
+        msg_cnt += 1
+
+        # total messages
+        processed_msgs["total_msgs"][msg["rule_type"]] += 1
+
+        # set port names
+        try:
+            msg["src_port"] = services[msg["src_port"]][msg["protocol"]]
+        except (IndexError, KeyError):
+            True
+
+        try:
+            msg["dst_port"] = services[msg["dst_port"]][msg["protocol"]]
+        except (IndexError, KeyError):
+            True
+
+        # resolve IP address names
+        if re.match(r'^127\.', msg["src_ip"]):
+            msg["src_host"] = msg["hostname"]
+        else:
+            msg["src_host"] = find_hostname(msg["src_ip"])
+
+        msg["dst_host"] = find_hostname(msg["dst_ip"])
+
+        # src IP counts
+        src_ip_cnts = processed_msgs["src_ip_cnts"][msg["rule_type"]]
+        try:
+            src_ip_cnts[msg["src_ip"]] += 1
+        except KeyError:
+            src_ip_cnts[msg["src_ip"]] = 1
+
+        dst_ip_cnts = processed_msgs["dst_ip_cnts"][msg["rule_type"]]
+        try:
+            dst_ip_cnts[msg["dst_ip"]] += 1
+        except KeyError:
+            dst_ip_cnts[msg["dst_ip"]] = 1
+
+        # set host pairs
+        host_pairs = processed_msgs["host_pairs"][msg["rule_type"]]
+        try:
+            host_pair = host_pairs[msg["src_ip"]]
+        except KeyError:
+            host_pairs[msg["src_ip"]] = {}
+            host_pair = host_pairs[msg["src_ip"]]
+
+        try:
+            host_pair[msg["dst_ip"]] += 1
+        except KeyError:
+            host_pair[msg["dst_ip"]] = 1
+
+        # protocol information
+        try:
+            msg["protocol"] = proto_trans[msg["protocol"]]
+        except KeyError:
+            msg["protocol"]
+
+        protocol_cnts = processed_msgs["protocol_cnts"][msg["rule_type"]]
+        try:
+            protocol_cnts[msg["protocol"]] += 1
+        except KeyError:
+            protocol_cnts[msg["protocol"]] = 1
+
+        # Set src and dst port numbers to port names.
+        src_port_cnts = processed_msgs["src_port_cnts"][msg["rule_type"]]
+        try:
+            src_port_cnts[msg["src_port"]] += 1
+        except KeyError:
+            src_port_cnts[msg["src_port"]] = 1
+
+        dst_port_cnts = processed_msgs["dst_port_cnts"][msg["rule_type"]]
+        try:
+            dst_port_cnts[msg["dst_port"]] += 1
+        except KeyError:
+            dst_port_cnts[msg["dst_port"]] = 1
+
+        # DoH counts.
+        if (
+            msg["rule_type"] == 'block' and
+            msg["rule"] is not None and msg["rule"] == 'Block DoH'
+        ):
+            processed_msgs["doh_msgs"].append(msg)
+
+        if opts.log_info and not msg_cnt % log_interval:
+            print(".", end="")
+
+    if opts.log_info:
+        print()
+
+    log.log(f'Processing time: {run_time(time.time() - start_time)}')
+    return processed_msgs
+
+
+def process_msgs_vpn(parsed_msgs_vpn: list) -> list:
+
+    """
+    Process parsed VPN messages.
+    """
+
+    # Type hints.
+    if not isinstance(parsed_msgs_vpn, list):
+        raise TypeError('parsed_msgs_vpn type must be list')
+
+    log.log('Processing VPN syslog messages')
+
+    processed_msgs = []
+
+    for msg in parsed_msgs_vpn:
+        if msg["src_ip"] is None:
+            msg["src_ip"] = '<unknown>'
+            msg["src_host"] = None
+        else:
+            msg["src_host"] = find_hostname(msg["src_ip"])
+
+        processed_msgs.append(msg)
+
+    return processed_msgs
+
+
+def query_geo(db: clintosaurous.db.connect, msg: dict) -> dict:
+
+    """
+    Determine GEO location of the external IP address.
+    """
+
+    # Type hints.
+    if not isinstance(db, clintosaurous.db.connect):
+        raise TypeError('db type must be clintosaurous.db.connect')
+    if not isinstance(msg, dict):
+        raise TypeError('msg type must be dict')
+
+    internal_regex = re.compile(r'192\.168\.|fc00:')
+    vpn_regex = re.compile(r'10\.')
+
+    if (
+        internal_regex.match(msg["dst_ip"])
+        and internal_regex.match(msg["src_ip"])
+    ):
+        return {
+            "country_code": 'US',
+            "country_name": 'United States of America',
+            "region_name": 'Florida',
+            "city_name": 'Tampa',
+            "time_zone": '-4:00'
+        }
+
+    elif vpn_regex.match(msg["dst_ip"]):
+        return {
+            "country_code": 'US',
+            "country_name": 'United States of America',
+            "region_name": 'VPN',
+            "city_name": None,
+            "time_zone": None
+        }
+
+    elif not internal_regex.match(msg["dst_ip"]):
+        search_ip = msg["dst_ip"]
+
+    else:
+        search_ip = msg["src_ip"]
+
+    try:
+        return geo_locations[search_ip]
+    except KeyError:
+        True
+
+    ip_addr = ipaddress.ip_address(search_ip)
+    ip_int = int(ip_addr)
+
+    if ip_addr.version == 4:
+        table_name = 'ip2location.ip2location_db11'
+    else:
+        table_name = 'ip2location.ip2location_db11_ipv6'
+
+    log.inf(f'Querying IP location information for {search_ip}')
+    sql = f"""
+        select
+            country_code, country_name,
+            region_name, city_name,
+            time_zone
+        from {table_name}
+        where {ip_int} between ip_from and ip_to
+        limit 1
+    """
+    log.dbg(f'query_geo(): sql:\n{sql}')
+    cursor = db.cursor(clintosaurous.db.pymysql.cursors.DictCursor)
+    cursor.execute(sql)
+    geo_data = cursor.fetchone()
+    cursor.close()
+
+    if not geo_data:
+        geo_data = {
+            "country_code": None,
+            "country_name": None,
+            "region_name": None,
+            "city_name": None,
+            "time_zone": None
+        }
+
+    geo_locations[search_ip] = geo_data
+    return geo_locations[search_ip]
+
+
+def query_pfsense_config(db: clintosaurous.db.connect) -> tuple:
+
+    """
+    Query pfSense saved configuration information from database.
+    """
+
+    # Type hints.
+    if not isinstance(db, clintosaurous.db.connect):
+        raise TypeError('db type must be clintosaurous.db.connect')
+
+    log.log('Querying pfSense rules from the database')
+
+    log.log('Querying interface information')
+    sql = 'select interface, descr from interfaces'
+    log.dbg(f'query_pfsense_config(): sql: {sql}')
+    cursor = db.cursor(clintosaurous.db.pymysql.cursors.DictCursor)
+    cursor.execute(sql)
+
+    ints = {}
+    for row in cursor:
+        ints[row["interface"]] = row["descr"]
+
+    log.log(f'{len(ints)} interfaces returned.')
+
+    log.log('Querying rules')
+    sql = 'select hostname, rule_id, int_name, descr from filter_rules'
+    log.dbg(f'query_pfsense_config(): sql: {sql}')
+    cursor = db.cursor(clintosaurous.db.pymysql.cursors.DictCursor)
+    cursor.execute(sql)
+
+    rules = {}
+    rule_cnt = 0
+    for row in cursor:
+        try:
+            firewall_rules = rules[row["hostname"]]
+        except KeyError:
+            rules[row["hostname"]] = {}
+            firewall_rules = rules[row["hostname"]]
+
+        rule_cnt = rule_cnt + 1
+        firewall_rules[row["rule_id"]] = row
+
+    cursor.close()
+
+    log.log(f'{rule_cnt} rules returned.')
+    return ints, rules
+
+
+def query_services(db: clintosaurous.db.connect) -> dict:
+
+    """
+    Query IP port and name information from database.
+    """
+
+    # Type hints.
+    if not isinstance(db, clintosaurous.db.connect):
+        raise TypeError('db type must be clintosaurous.db.connect')
+
+    log.log('Querying network port services')
+
+    sql = 'select port, protocol, name from services'
+    log.dbg(f'query_syslog_fw(): sql: {sql}')
+    cursor = db.cursor(clintosaurous.db.pymysql.cursors.DictCursor)
+    cursor.execute(sql)
+
+    services = {}
+    for row in cursor:
+        try:
+            services[row["port"]]
+        except KeyError:
+            services[row["port"]] = {}
+
+        services[row["port"]][row["protocol"].upper()] = \
+            f'{row["port"]}/{row["name"]}'
+
+    return services
+
+
+def query_syslog_fw(db: clintosaurous.db.connect) -> list:
+
+    """
+    Query firewall messages from syslog table.
+    """
+
+    # Type hints.
+    if not isinstance(db, clintosaurous.db.connect):
+        raise TypeError('db type must be clintosaurous.db.connect')
+
+    log.log(
+        "Querying firewall syslog messages from the LibreNMS database"
+    )
+
+    log.log('Querying messages')
+    sql = """
+        select
+            case
+                when sl.program = 'FILTERLOG' then 'pfSense'
+                when sl.msg like '%%UFW ALLOW%%'
+                    or sl.msg like '%%UFW BLOCK%%'
+                    or sl.msg like '%%FINAL_REJECT%%'
+                    then 'UFW'
+                else null
+            end as vendor,
+            sl.timestamp,
+            case
+                when dev.display is null then dev.hostname
+                else dev.display
+            end as hostname,
+            sl.program,
+            sl.msg
+
+        from syslog as sl
+
+        inner join devices as dev
+            on dev.device_id = sl.device_id
+
+        where
+            sl.timestamp between %s and %s
+            and (
+                sl.program = 'FILTERLOG'
+                or (
+                    sl.program = 'kernel'
+                    and (
+                        sl.msg like '%%UFW BLOCK%%'
+                        or sl.msg like '%%FINAL_REJECT%%'
+                    )
+                )
+            )
+    """
+    log.dbg(f'query_syslog_fw(): sql:\n{sql}')
+    current_time = time.time()
+    cursor = db.cursor(clintosaurous.db.pymysql.cursors.DictCursor)
+    start = opts.date + " 00:00:00"
+    end = opts.date + " 23:59:59"
+    cursor.execute(sql, (start, end))
+    log_msgs = list(cursor.fetchall())
+    cursor.close()
+
+    log.log(f'Query time: {run_time(time.time() - current_time)}')
+    log.log(f'{len(log_msgs):,} messages returned.')
+
+    return log_msgs
+
+
+def query_syslog_vpn(db: clintosaurous.db.connect) -> list:
+
+    """
+    Query VPN messages from the syslog table.
+    """
+
+    # Type hints.
+    if not isinstance(db, clintosaurous.db.connect):
+        raise TypeError('db type must be clintosaurous.db.connect')
+
+    log.log('Querying VPN syslog messages from the LibreNMS database')
+
+    log.log('Querying messages')
+    sql = """
+        select
+            sl.timestamp,
+            case
+                when dev.display is null then dev.hostname
+                else dev.display
+            end as hostname,
+            sl.facility,
+            sl.priority,
+            sl.level,
+            sl.program,
+            sl.msg
+
+        from syslog as sl
+
+        inner join devices as dev
+            on dev.device_id = sl.device_id
+
+        where
+            sl.timestamp between %s and %s
+            and sl.program = 'OPENVPN'
+            and (
+                sl.msg like '%%Peer Connection%%'
+                or sl.msg like 'user%%'
+            )
+
+        order by
+            sl.timestamp,
+            sl.msg
+    """
+    log.dbg(f'query_syslog_vpn(): sql:\n{sql}')
+    current_time = time.time()
+    cursor = db.cursor(clintosaurous.db.pymysql.cursors.DictCursor)
+    start = opts.date + " 00:00:00"
+    end = opts.date + " 23:59:59"
+    cursor.execute(sql, (start, end))
+    log_msgs = list(cursor.fetchall())
+    cursor.close()
+
+    log.log(f'Query time: {run_time(time.time() - current_time)}')
+    log.log(f'{len(log_msgs):,} messages returned.')
+
+    return log_msgs
+
+
+def rpts_db_update(rpts: list) -> None:
+
+    """
+    Update reports database with report data.
+    """
+
+    # Type hints.
+    if not isinstance(rpts, list):
+        raise TypeError('rpts type must be list')
+
+    log.log('Updating reports database')
+
+    rpt_user, rpt_passwd = credentials.get('mysql-report_rw')
+    db = clintosaurous.db.connect(
+        host='mysql1.clintosaurous.com',
+        user=rpt_user,
+        passwd=rpt_passwd,
+        database='reports',
+        logging=True
+    )
+
+    for rpt in rpts:
+        table_name = rpt["db_table"]
+        date_col = rpt["db_date_col"]
+        columns = rpt["db_columns"]
+        rows = rpt["db_rows"]
+
+        log.log(f'Processing {table_name} table updates')
+        log.log(f'Deleting existing records for date {opts.date}')
+
+        if date_col == 'datestamp':
+            sql = f'delete from {table_name} where datestamp = %s'
+            args = (opts.date)
+        else:
+            sql = \
+                f'delete from {table_name} where timestamp between %s and %s'
+            args = (rpt_start_time, rpt_end_time)
+        log.dbg(sql)
+
+        cursor = db.cursor()
+        cursor.execute(sql, args)
+        cursor.close()
+        db.commit()
+
+        log.log(f'Inserting {len(rows):,} report rows')
+        col_list = ", ".join(columns)
+        value_list = []
+        for col_name in range(len(columns)):
+            value_list.append("%s")
+        value_list = ", ".join(value_list)
+        sql = f'insert into {table_name} ({col_list}) values ({value_list})'
+        log.dbg(f'rpts_db_update(): sql:\n{sql}')
+
+        cursor = db.cursor()
+        cursor.executemany(sql, rows)
+        cursor.close()
+        db.commit()
+
+    cleanup_db(db)
+
+    db.close()
+
+
+def rpts_generate(
+    db: clintosaurous.db.connect,
+    processed_msgs_fw: dict,
+    processed_msgs_vpn: list
+) -> list:
+
+    """
+    Generate output reports from parsed and processed data.
+    """
+
+    # Type hints.
+    if not isinstance(db, clintosaurous.db.connect):
+        raise TypeError('db type must be clintosaurous.db.connect')
+    if not isinstance(processed_msgs_fw, dict):
+        raise TypeError('processed_msgs_fw type must be dict')
+    if not isinstance(processed_msgs_vpn, list):
+        raise TypeError('processed_msgs_vpn type must be list')
+
+    log.log('Generating report data')
+
+    rpts = []
+
+    # DNS over HTTPS (DoH) messages.
+    log.log('Generating DoH block messages report')
+    rpt = {
+        "db_table": "firewall_doh_counts",
+        "db_date_col": "timestamp",
+        "db_columns": [
+            "timestamp", "host", "interface",
+            "src_ip", "src_dns_name", "dst_ip", "dst_dns_name"
+        ],
+        "db_rows": []
+    }
+    for msg in processed_msgs_fw["doh_msgs"]:
+        src_name = find_hostname(msg["src_ip"])
+        dst_name = find_hostname(msg["dst_ip"])
+        rpt["db_rows"].append([
+            msg["timestamp"], msg["hostname"], msg["interface"],
+            msg["src_ip"], src_name, msg["dst_ip"], dst_name
+        ])
+    rpts.append(rpt)
+
+    # Host total connections.
+    log.log('Generating total connections by host report')
+    rpt = {
+        "db_table": 'firewall_src_ip_counts',
+        "db_date_col": 'datestamp',
+        "db_columns": [
+            'datestamp', 'rule_type',
+            'src_ip', 'src_dns_name',
+            'count', 'percentage',
+            'country_code', 'country_name',
+            'region_name', 'city_name',
+            'time_zone'
+        ],
+        "db_rows": []
+    }
+
+    for rule_type in ['block', 'pass']:
+        total_msgs_fw = processed_msgs_fw["total_msgs"][rule_type]
+        host_counts = processed_msgs_fw["src_ip_cnts"][rule_type]
+
+        for src_ip in host_counts.keys():
+            src_name = find_hostname(src_ip)
+            geo = query_geo(db, {"src_ip": src_ip, "dst_ip": src_ip})
+            percent = round(host_counts[src_ip] / total_msgs_fw * 100, 1)
+
+            rpt["db_rows"].append([
+                opts.date, rule_type,
+                src_ip, src_name,
+                host_counts[src_ip], percent,
+                geo["country_code"], geo["country_name"],
+                geo["region_name"], geo["city_name"],
+                geo["time_zone"]
+            ])
+
+        rpts.append(rpt)
+
+    # End host total connections.
+
+    # Protocol count report.
+    log.log('Generating total connections by protocol report')
+    rpt = {
+        "db_table": 'firewall_protocol_summary',
+        "db_date_col": 'datestamp',
+        "db_columns": [
+            'datestamp', 'rule_type', 'protocol', 'count', 'percentage'
+        ],
+        "db_rows": []
+    }
+
+    for rule_type in ['block', 'pass']:
+        total_msgs_fw = processed_msgs_fw["total_msgs"][rule_type]
+
+        protocol_cnts = processed_msgs_fw["protocol_cnts"][rule_type]
+        rev_prot_cnts = {}
+        for proto in protocol_cnts.keys():
+            try:
+                rev_prot_cnts[protocol_cnts[proto]].append(proto)
+            except KeyError:
+                rev_prot_cnts[protocol_cnts[proto]] = [proto]
+
+        keys = []
+        for key in rev_prot_cnts.keys():
+            keys.append(key)
+        keys.sort()
+        keys.reverse()
+
+        for cnt in keys:
+            rev_prot_cnts[cnt].sort()
+            percent = round(cnt / total_msgs_fw * 100, 1)
+
+            for proto in rev_prot_cnts[cnt]:
+                rpt["db_rows"].append(tuple(
+                    [opts.date, rule_type, proto, cnt, percent]))
+
+    rpts.append(rpt)
+
+    # End protocol count report.
+
+    # VPN messages.
+    log.log('Generating all VPN log messages report')
+    rpt = {
+        "db_table": 'firewall_vpn_messages',
+        "db_date_col": 'timestamp',
+        "db_columns": [
+            'timestamp', 'host',
+            'src_ip', 'src_dns_name',
+            'message_type', 'user',
+            'message',
+            'country_code', 'country_name',
+            'region_name', 'city_name',
+            'time_zone'
+        ],
+        "db_rows": []
+    }
+
+    for msg in processed_msgs_vpn:
+        geo = \
+            query_geo(db, {"src_ip": msg["src_ip"], "dst_ip": msg["src_ip"]})
+        rpt["db_rows"].append([
+            msg["timestamp"], msg["hostname"],
+            msg["src_ip"], msg["src_host"],
+            msg["msg_type"], msg["user"], msg["status"],
+            geo["country_code"], geo["country_name"],
+            geo["region_name"], geo["city_name"],
+            geo["time_zone"]
+        ])
+
+    rpts.append(rpt)
+
+    # End VPN messages.
+
+    # Host pairs report.
+    log.log('Generating host pairs report')
+    rpt = {
+        "db_table": 'firewall_host_pairs',
+        "db_date_col": 'datestamp',
+        "db_columns": [
+            'datestamp', 'rule_type',
+            'src_ip', 'src_dns_name',
+            'dst_ip', 'dst_dns_name',
+            'count', 'percentage'
+        ],
+        "db_rows": []
+    }
+
+    for rule_type in ['block', 'pass']:
+        total_msgs_fw = processed_msgs_fw["total_msgs"][rule_type]
+        host_pairs = processed_msgs_fw["host_pairs"][rule_type]
+
+        rev_host_pairs = {}
+        for src_ip in host_pairs.keys():
+            dst_ips = host_pairs[src_ip]
+            for dst_ip in dst_ips.keys():
+                cnt = dst_ips[dst_ip]
+
+                try:
+                    rev_host_pairs[cnt]
+                except KeyError:
+                    rev_host_pairs[cnt] = {}
+
+                try:
+                    rev_host_pairs[cnt][dst_ip].append(src_ip)
+                except KeyError:
+                    rev_host_pairs[cnt][dst_ip] = [src_ip]
+
+        cnts = []
+        for cnt in rev_host_pairs.keys():
+            cnts.append(cnt)
+        cnts.sort()
+        cnts.reverse()
+
+        for cnt in cnts:
+            percent = round(cnt / total_msgs_fw * 100, 1)
+
+            dst_ips = []
+            for dst_ip in rev_host_pairs[cnt].keys():
+                dst_ips.append(dst_ip)
+            dst_ips.sort()
+
+            for dst_ip in dst_ips:
+                dst_name = find_hostname(dst_ip)
+                src_ips = []
+                for src_ip in rev_host_pairs[cnt][dst_ip]:
+                    src_ips.append(src_ip)
+                src_ips.sort()
+
+                for src_ip in src_ips:
+                    src_name = find_hostname(src_ip)
+                    rpt["db_rows"].append([
+                        opts.date, rule_type,
+                        src_ip, src_name,
+                        dst_ip, dst_name,
+                        cnt, percent
+                    ])
+
+    rpts.append(rpt)
+
+    # End host pairs report.
+
+    # All messages report.
+    log.log('Generating all firewall messages report')
+    rpt = {
+        "db_table": 'firewall_messages',
+        "db_date_col": 'timestamp',
+        "db_columns": [
+            'timestamp', 'host', 'interface',
+            'rule_type', 'rule',
+            'src_ip', 'src_dns_name', 'src_port',
+            'dst_ip', 'dst_dns_name', 'dst_port',
+            'protocol',
+            'country_code', 'country_name',
+            'region_name', 'city_name',
+            'time_zone'
+        ],
+        "db_rows": []
+    }
+
+    for msg in processed_msgs_fw["msgs"]:
+        geo = query_geo(db, msg)
+        rpt["db_rows"].append([
+            msg["timestamp"], msg["hostname"], msg["interface"],
+            msg["rule_type"], msg["rule"],
+            msg["src_ip"], msg["src_host"], msg["src_port"],
+            msg["dst_ip"], msg["dst_host"], msg["dst_port"],
+            msg["protocol"],
+            geo["country_code"], geo["country_name"],
+            geo["region_name"], geo["city_name"],
+            geo["time_zone"]
+        ])
+
+    rpts.append(rpt)
+
+    # End all messages report.
+
+    return rpts
+
+
+if __name__ == '__main__':
+    opts = cli_opts()
+    geo_file = '/tmp/firewall-reports.geo.json'
+    geo_locations = json_read(geo_file)
+    nslookup_file = '/tmp/firewall-reports.lookups.json'
+    dns_queries = json_read(nslookup_file)
+
+    rpt_start_time = f'{opts.date} 00:00:00'
+    rpt_end_time = f'{opts.date} 23:59:59'
+
+    log.log(f'Generating report for {opts.date}')
+
+    credentials = clintosaurous.credentials.data()
+    fw_user, fw_passwd = credentials.get('mysql-pfsense_firewall')
+    sl_user, sl_passwd = credentials.get('mysql-syslog_ro')
+
+    db = clintosaurous.db.connect(
+        host='mysql1.clintosaurous.com',
+        user=fw_user,
+        passwd=fw_passwd,
+        database='pfsense_firewall',
+        logging=True
+    )
+    services = query_services(db)
+    pfsense_ints, pfsense_rules = query_pfsense_config(db)
+    db.close()
+
+    db = clintosaurous.db.connect(
+        host='mysql1.clintosaurous.com',
+        user=sl_user,
+        passwd=sl_passwd,
+        database='librenms',
+        logging=True
+    )
+    msgs_fw = query_syslog_fw(db)
+    msgs_vpn = query_syslog_vpn(db)
+
+    parsed_msgs_fw = parse_msgs_fw(pfsense_ints, pfsense_rules, msgs_fw)
+    processed_msgs_fw = process_msgs_fw(services, parsed_msgs_fw)
+
+    parsed_msgs_vpn = parse_msgs_vpn(msgs_vpn)
+    processed_msgs_vpn = process_msgs_vpn(parsed_msgs_vpn)
+    rpts = rpts_generate(db, processed_msgs_fw, processed_msgs_vpn)
+
+    db.close()
+
+    json_write(geo_file, geo_locations)
+
+    rpts_db_update(rpts)
+
+    log.log('Report generation complete.')
+    log.log(f'Run time: {run_time()}')

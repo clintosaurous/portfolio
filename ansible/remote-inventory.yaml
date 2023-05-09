@@ -1,0 +1,75 @@
+---
+# Generate Remote Host Inventory File and Sync Variable Files
+#
+# Version: 1.2.0
+# Last Update: 2023-05-03
+
+
+- name: Read Inventory File
+  hosts: localhost
+  gather_facts: false
+
+  tasks:
+    - name: Read Local Ansible Inventory File
+      include_vars:
+        file: /etc/ansible/hosts
+        name: inv_file
+
+
+- name: Update Ansible Inventory File
+  hosts: "!mylaptop:ansiblehost"
+  gather_facts: false
+  become: true
+
+  tasks:
+    - name: Synchronize /etc/ansible
+      synchronize:
+        src: /etc/ansible
+        dest: /etc/
+        archive: false
+        delete: true
+        recursive: true
+        times: true
+        rsync_opts:
+          - "--exclude=ansible/hosts"
+
+    - name: Inventory Group Variables
+      set_fact:
+        inv_file: "{{ hostvars.localhost.inv_file }}"
+        inv_groups: "{{
+          hostvars.localhost.inv_file.all.children |
+          combine({'desktop': {'hosts': {}}}) }}"
+        new_inv_groups: {}
+
+    - name: Update Hosts Lists
+      include_tasks: tasks/remote-inventory-hosts.yaml
+      with_dict: "{{ inv_groups }}"
+      loop_control:
+        label: "{{ inv_group.key }}"
+        loop_var: inv_group
+
+    - name: Build New Inventory
+      set_fact:
+        new_inv: "{{ {'all': {
+          'hosts': inv_file.hosts | default({}),
+          'children': new_inv_groups
+          } } }}"
+
+    - name: Save New Inventory
+      copy:
+        dest: /etc/ansible/hosts
+        content: "{{
+          new_inv | to_nice_yaml(explicit_start=True, indent=2) }}"
+        owner: clint
+        group: mgmt
+        mode: u=rw,g=r,o=
+        force: true
+
+    - name: Reset Directory Permissions
+      file:
+        path: /etc/ansible
+        state: directory
+        owner: clint
+        group: mgmt
+        mode: g-w,o=
+        recurse: true

@@ -1,0 +1,416 @@
+---
+# Standard Ubuntu Host Data Backup
+#
+# Version: 1.2.3
+# Last Update: 2025-05-09
+
+
+# Import the template list of backup paths from the local host.
+- name: Import Data Backup Lists
+  hosts: localhost
+  gather_facts: false
+
+  tasks:
+    - name: Read Backup Lists
+      include_vars:
+        file: /etc/ansible/vars/data-backup.yaml
+        name: bkup_list
+
+    - name: Init localhost Variables
+      set_fact:
+        bkup_ageout: 14d
+        svc_bkup_ageout: 7d
+
+
+# Generate list of directories and files to be backed up on the host.
+- name: data-backup tar Paths
+  hosts: desktop:ubuntuhost
+  # Facts needed for the `ansible_date_time' variable.
+  gather_facts: true
+  become: true
+
+  tasks:
+    - name: Define Host Backup Variables
+      set_fact:
+        # Location to generate backups in.
+        bkup_dir_base: /var/tmp/backup
+        bkup_dir: "/var/tmp/backup/{{ inventory_hostname }}"
+
+        # Master list of backup paths imported via the local Ansible host.
+        bkup_paths: "{{ hostvars.localhost.bkup_list.paths }}"
+
+        # Date/time the backup is taking place. Used for file names.
+        bkup_time: "{{ ansible_date_time.date }}-{{ ansible_date_time.hour }}-{{ ansible_date_time.minute }}"
+
+        # Init files discovered using `find`.
+        find_files: []
+
+        # Init list of home directories to search for files to backup.
+        home_paths: ["/root"]
+
+        # Shortcut variable for all contents in the `data-backup.yaml`
+        # configuration file.
+        lhost_vars: "{{ hostvars.localhost.bkup_list }}"
+
+        # Init paths to be backed variable adding paths to be backed up on all
+        # hosts.
+        paths: "{{ hostvars.localhost.bkup_list.paths.all }}"
+
+        # List of paths to files and directories to add to the backup file.
+        tar_paths: []
+
+    # Add Ansible group specific backup paths for the host.
+    - name: Select Global Backup Paths
+      set_fact:
+        paths: "{{ (paths + bkup_paths[item]) | sort }}"
+      when: item in bkup_paths
+      loop: "{{ group_names }}"
+
+    # List all home directories in `/home`.
+    - name: Home Path Find
+      find:
+        paths: "/home"
+        file_type: directory
+        recurse: false
+      register: home_find
+
+    # Add discovered `/home` directories to the list of home directories to be
+    # searched for directories and files to backup.
+    - name: Home Directories from Find
+      set_fact:
+        home_paths: "{{ home_paths + [item.path] }}"
+      loop: "{{ home_find.files }}"
+      loop_control:
+        label: "{{ item.path }}"
+
+    # Execute task script for each home directory to add list of directories
+    # and files to be backed up.
+    - name: Process Home Directory
+      include_tasks: tasks/data-backup-home.yaml
+      loop: "{{ home_paths }}"
+      loop_control:
+        loop_var: home_path
+
+    # Stat all non-wildcard paths to see if they exist.
+    - name: Stat Path Check
+      stat:
+        path: "{{ item }}"
+      register: stat_results
+      when: "'*' not in item"
+      loop: "{{ paths | sort }}"
+
+    # From the stat data, add directories and files that exist to the list of
+    # directories and files to be added to the backup file.
+    - name: Stat to Files List
+      set_fact:
+        tar_paths: "{{ tar_paths + [item.item] }}"
+      when: "'stat' in item and item.stat.exists"
+      loop: "{{ stat_results.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+
+    # Use the `find` call to find directories and files for wildcard paths.
+    - name: Find Path Check
+      find:
+        paths: "{{ [item | dirname] }}"
+        patterns: "{{ [item | basename] }}"
+        file_type: any
+        recurse: false
+      register: find_results
+      when: "'*' in item"
+      loop: "{{ paths | sort }}"
+
+    # From the find data, add directories and files to the list of discovered
+    # directories and files.
+    - name: Find to Files List
+      set_fact:
+        find_files: "{{ find_files + item.files }}"
+      changed_when: item.files
+      when: "'files' in item"
+      loop: "{{ find_results.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+
+    # From the find data, add found directories and files to the list of
+    # directories and files to be added to the backup file.
+    - name: Find Files List to Out List
+      set_fact:
+        tar_paths: "{{ tar_paths + [item.path] }}"
+      loop: "{{ find_files }}"
+      loop_control:
+        label: "{{ item.path }}"
+
+
+# Generate the backup tar file.
+- name: Perform Backup
+  hosts: desktop:ubuntuhost
+  gather_facts: false
+  become: true
+
+  tasks:
+    # The backup is only stored on the host temporarily. Delete any previous
+    # data for a backup that was interupted or failed.
+    - name: Delete Previous Failed Backups
+      file:
+        path: "{{ bkup_dir_base }}"
+        state: absent
+
+    # Create directory the backup files will be stored in.
+    - name: Create Host Backup Path
+      file:
+        path: "{{ bkup_dir }}"
+        state: directory
+        mode: u=rwx,g=rswx,o=
+        owner: "{{ lhost_vars.owner }}"
+        group: "{{ lhost_vars.group }}"
+
+    # For DHCP servers, reload the service to flush lease information to the
+    # leases file for backup.
+    - name: For dhcpd Dump
+      service:
+        name: isc-dhcp-server
+        state: reloaded
+      when: "'ddidhcp' in group_names"
+      ignore_errors: true
+
+    # For DNS servers, reload the the service to flush the most recent DNS
+    # information to the database files for backup.
+    - name: For named Dump
+      service:
+        name: named
+        state: reloaded
+      when: "'ddidns' in group_names"
+      ignore_errors: true
+
+    # Create the backup tar file.
+    - name: Create Backup File
+      archive:
+        dest: "{{ bkup_dir }}/backup-{{ bkup_time }}.tar.gz"
+        path: "{{ tar_paths }}"
+        mode: u=rw,g=rw,o=
+        owner: "{{ lhost_vars.owner }}"
+        group: "{{ lhost_vars.group }}"
+
+
+# For LibreNMS hosts, generate a separate tar file for the LibreNMS RRD data.
+- name: Backup LibreNMS RRD Data
+  hosts: librenms
+  gather_facts: false
+  become: true
+
+  vars:
+    librenms_bkup_dir: "{{ bkup_dir }}/librenms"
+
+  tasks:
+    # Ensure the host's LibreNMS backup directory exists.
+    - name: LibreNMS Backup Directory
+      file:
+        path: "{{ librenms_bkup_dir }}"
+        state: directory
+        mode: u=rwx,g=rwx,o=
+        owner: "{{ lhost_vars.owner }}"
+        group: "{{ lhost_vars.group }}"
+
+    # Generate RRD backup data tar file.
+    - name: Create Backup File
+      archive:
+        dest: "{{ librenms_bkup_dir }}/librenms-backup-{{ bkup_time }}.tar.gz"
+        path: "{{ lhost_vars.service_paths.librenms }}"
+        mode: "660"
+        owner: "{{ lhost_vars.owner }}"
+        group: "{{ lhost_vars.group }}"
+
+
+# Backup database data on MySQL servers.
+- name: Backup MySQL Server Databases
+  hosts: mysqlsrv
+  gather_facts: false
+  become: true
+
+  vars:
+    mysql_bkup_dir: "{{ bkup_dir }}/mysql"
+
+  tasks:
+    # Ensure the host's LibreNMS backup directory exists.
+    - name: MySQL Backup Directory
+      file:
+        path: "{{ mysql_bkup_dir }}"
+        state: directory
+
+    # Dump the databases into a backup gzip file.
+    - name: Dump Databases
+      community.mysql.mysql_db:
+        login_unix_socket: /run/mysqld/mysqld.sock
+        state: dump
+        name: all
+        target: "{{ mysql_bkup_dir }}/mysql-backup-{{ bkup_time }}.sql.gz"
+
+
+# Backup Plex media server database.
+- name: Backup Plex Server Database
+  hosts: plexsrv
+  gather_facts: false
+  become: true
+
+  vars:
+    plex_bkup_dir: "{{ bkup_dir }}/plex"
+
+  tasks:
+    # Ensure the host's Plex backup directory exists.
+    - name: Plex Backup Directory
+      file:
+        path: "{{ plex_bkup_dir }}"
+        state: directory
+        mode: "770"
+        owner: "{{ lhost_vars.owner }}"
+        group: "{{ lhost_vars.group }}"
+
+    # Generate Plex database backup data tar file.
+    - name: Create Backup File
+      archive:
+        dest: "{{ plex_bkup_dir }}/plex-backup-{{ bkup_time }}.tar.gz"
+        path: "{{ lhost_vars.service_paths.plexsrv }}"
+        mode: "660"
+        owner: "{{ lhost_vars.owner }}"
+        group: "{{ lhost_vars.group }}"
+
+
+# Ensure the remote backup path owner and privileges are set to the Ansible
+# backup user. If it is not set, the Ansible backup user will not be able to
+# read the backups.
+- name: Backup Owner and Privileges
+  hosts: desktop:ubuntuhost
+  gather_facts: false
+  become: true
+
+  vars:
+    dst_bkup_dir: /backup
+
+  tasks:
+    - name: Host Backup Path Privileges
+      file:
+        path: "{{ bkup_dir }}"
+        state: directory
+        mode: "g+rw,o="
+        owner: "{{ lhost_vars.owner }}"
+        group: "{{ lhost_vars.group }}"
+        recurse: true
+
+
+# Synchronize the backup(s) created on the remote host.
+- name: Backup Synchronization
+  hosts: desktop:ubuntuhost
+  gather_facts: false
+
+  vars:
+    dst_bkup_dir: /backup
+
+  tasks:
+    - name: Synchronize Backup Directories
+      synchronize:
+        mode: pull
+        src: "{{ bkup_dir }}"
+        dest: "{{ dst_bkup_dir }}/"
+        archive: false
+        compress: false
+        recursive: true
+
+
+# Delete generated backup data on the remote host.
+- name: Remote Backup Directory Clean Up
+  hosts: desktop:ubuntuhost
+  gather_facts: false
+  become: true
+
+  tasks:
+    - name: Delete Remote Backup Directory
+      file:
+        path: "{{ bkup_dir_base }}"
+        state: absent
+
+
+# Ensure the local backup directory ownership and permissions.
+- name: localhost Backup Directory Owner and Permissions
+  hosts: localhost
+  gather_facts: false
+  become: true
+
+  tasks:
+    - name: Directory Owner and Permissions
+      file:
+        path: /backup
+        state: directory
+        mode: "g+rw,o="
+        owner: "{{ bkup_list.owner }}"
+        group: "{{ bkup_list.group }}"
+        recurse: true
+
+
+# Clean up old backup data from the local host.
+- name: localhost Backup Directory Clean Up
+  hosts: localhost
+  gather_facts: false
+
+  vars:
+    delete_list: []
+
+  tasks:
+    # For each host backed up, find general backup files older than
+    # `bkup_ageout`.
+    - name: Find Old Data Backup Files
+      find:
+        paths: "/backup/{{ item.key }}"
+        patterns:
+          - "backup-*"
+        age: "{{ bkup_ageout }}"
+        recurse: true
+      register: bkup_files_find
+      when: "item.key != 'localhost'"
+      with_dict: "{{ hostvars }}"
+      loop_control:
+        label: "{{ item.key }}"
+
+    # For each host backed up, find service backup files older than
+    # `svc_bkup_ageout`.
+    - name: Find Old Service Data Backups
+      find:
+        paths: "/backup/{{ item.key }}"
+        patterns:
+          - "librenms-backup-*"
+          - "mysql-backup-*"
+          - "plex-backup-*"
+        age: "{{ svc_bkup_ageout }}"
+        recurse: true
+      register: svc_bkup_files_find
+      when: "item.key != 'localhost'"
+      with_dict: "{{ hostvars }}"
+      loop_control:
+        label: "{{ item.key }}"
+
+    # Generate list of general backup files to delete from `find`.
+    - name: Generate Old Data Backup File List
+      set_fact:
+        delete_list: "{{ delete_list + item.files }}"
+      when: "'files' in item and item.files"
+      changed_when: "'files' in item and item.files"
+      loop: "{{ bkup_files_find.results }}"
+      loop_control:
+        label: "{{ item.item.key }}"
+
+    # Generate list of service backup files to delete from `find`.
+    - name: Generate Old Service Backup File List
+      set_fact:
+        delete_list: "{{ delete_list + item.files }}"
+      when: "'files' in item and item.files"
+      changed_when: "'files' in item and item.files"
+      loop: "{{ svc_bkup_files_find.results }}"
+      loop_control:
+        label: "{{ item.item.key }}"
+
+    - name: Delete Old Backup Files
+      file:
+        path: "{{ item.path }}"
+        state: absent
+      loop: "{{ delete_list }}"
+      loop_control:
+        label: "{{ item.path }}"

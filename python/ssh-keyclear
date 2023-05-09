@@ -1,0 +1,64 @@
+#!/opt/clintosaurous/venv/bin/python3 -Bu
+
+"""
+Clears SSH keys for host provided.
+"""
+
+
+import ipaddress
+import os
+import re
+import socket
+import sys
+
+
+VERSION = "3.1.0"
+LAST_UPDATE = "2022-09-29"
+
+
+try:
+    sys.argv[1]
+except IndexError:
+    print("Usage: ssh-keyclear hostname|ip")
+
+clear_hosts = []
+
+try:
+    ip = str(ipaddress.ip_address(sys.argv[1]))
+
+except ValueError:
+    try:
+        dns_name = socket.getfqdn(sys.argv[1]).lower()
+        clear_hosts.append(dns_name)
+        hostname = re.sub(r'\.clintosaurous.com', '', dns_name)
+        if dns_name != hostname:
+            clear_hosts.append(hostname)
+
+        try:
+            clear_hosts.append(socket.gethostbyname(dns_name).lower())
+
+        except (socket.gaierror, socket.herror, IndexError):
+            True
+
+    except (socket.gaierror, socket.herror, IndexError):
+        True
+
+else:
+    clear_hosts.append(ip)
+    try:
+        dns_name = socket.getfqdn(sys.argv[1]).lower()
+
+    except (socket.gaierror, socket.herror, IndexError):
+        True
+
+    else:
+        if dns_name != ip:
+            clear_hosts.append(dns_name)
+            hostname = re.sub(r'\.clintosaurous.com', '', dns_name)
+            if dns_name != hostname:
+                clear_hosts.append(hostname)
+
+
+for host in sorted(clear_hosts):
+    print(f'Clearing SSH key for {host}')
+    output = os.popen(f"ssh-keygen -R '{host}' 2>&1").read()

@@ -1,0 +1,90 @@
+---
+fqdn: "{{ inventory_hostname }}.clintosaurous.com"
+
+mgmt_hosts:
+  - host: mylaptop
+    ip: 10.10.11.0/24
+  - host: mgmt1
+    ip: 10.10.10.5
+
+clint_home_nets:
+  - name: Scrotum Sluts
+    address: 10.10.11.0/24
+    bcast: 10.10.11.255
+  - name: Basement Hoes
+    address: 10.10.10.0/24
+    bcast: 10.10.10.255
+
+clint_noc: 10.10.10.5
+clint_ns1:
+  - 10.10.11.250
+  - 10.10.10.11
+
+clint_snmp_ro: scrubbed
+clint_snmp_contact: support@clintosaurous.com
+clint_snmp_location: Unknown
+
+mgmt_svc_passwd: scrubbed
+mgmt_svc_ssh_key: scrubbed
+clint_ssh_key: scrubbed
+vmhost_passwd: scrubbed
+
+clint_packages:
+  ubuntuhost:
+    - bind9-dnsutils
+    - bzip2
+    - chrony
+    - dkms
+    - git
+    - mailutils
+    - mysql-client
+    - python3-pymysql
+    - net-tools
+    - postfix
+    - python3-doc
+    - python3-pip
+    - python3-venv
+    - snmpd
+    - unzip
+    - vim
+    - wget
+
+  ansiblehost:
+    - ansible
+    - python3-certifi
+    - python3-daemon
+    - python3-magic
+    - python3-openpyxl
+    - python3-paramiko
+    - python3-scp
+
+  apache2:
+    - apache2
+    - apache2-suexec-pristine
+
+  ddidhcp:
+    - isc-dhcp-server
+    - dhcpd-pools
+
+  ddidns:
+    - bind9
+    - bind9-doc
+    - bind9-utils
+    - libfile-readbackwards-perl
+
+  desktop:
+    - bind9-dnsutils
+    - brave-browser
+    - cinnamon-desktop-environment
+
+  keepalived:
+    - heartbeat
+    - keepalived
+    - ldirectord
+    - pcs
+
+  mysqlsrv:
+    - mysql-server
+
+  stubbysrv:
+    - stubby

@@ -1,0 +1,207 @@
+---
+# Provision `apt` Packages on Ubuntu Hosts
+#
+# Provision common `apt` packages on an Ubuntu 20.04 or 22.04 server.
+#
+# Version: 2.2.0
+# Last Updated: 2023-05-09
+
+
+# `apt` repositories to be added to desktop hosts.
+- name: Desktop apt Repositories
+  hosts: desktop
+  gather_facts: false
+  become: true
+
+  vars:
+    # Brave Browser repository data.
+    brave_gpg_path: /etc/apt/trusted.gpg.d/brave-browser-archive-keyring.gpg
+    brave_gpg_url: https://brave-browser-apt-release.s3.brave.com/brave-browser-archive-keyring.gpg
+    brave_list_txt: "deb [signed-by={{ brave_gpg_path }} arch=amd64] https://brave-browser-apt-release.s3.brave.com/ stable main"
+
+  tasks:
+    # Check if the the Brave Browser repository GPG key exists.
+    - name: Stat Brave Browser GPG Key File
+      stat:
+        path: "{{ brave_gpg_path }}"
+      register: brave_gpg_stat
+
+    # Download Brave Browser repository GPG key if not already.
+    - name:  Download Brave Browser GPG Key
+      get_url:
+        url: "{{ brave_gpg_url }}"
+        dest: "{{ brave_gpg_path }}"
+      when: not brave_gpg_stat.stat.exists
+
+    # Add the Brave Browser `apt` repository.
+    - name: Brave Browser Repository
+      apt_repository:
+        repo: "{{ brave_list_txt }}"
+        filename: brave-browser-release
+        state: present
+      register: brave_apt_repo
+
+    # Perform `apt update` if repository was added.
+    - name: apt update
+      apt:
+        update_cache: "yes"
+      register: apt_update
+      failed_when: false
+      when: brave_apt_repo.changed
+
+
+# Install applicable `apt` packages.
+- name: Install apt Packages
+  hosts: desktop:ubuntuhost
+  gather_facts: false
+  become: true
+
+  vars:
+    # Init packages to install with `ubuntuhost`/all host packages.
+    apt_pkgs: "{{ clint_packages.ubuntuhost }}"
+
+  tasks:
+    - name: apt update
+      apt:
+        update_cache: "yes"
+        cache_valid_time: 7200
+
+    - name: apt upgrade
+      apt:
+        upgrade: "yes"
+      register: apt_upgrade
+
+    # Sometimes packages are not upgraded for various reasons. Check if there
+    # are skipped packages.
+    - name: Check For Skipped Packages
+      set_fact:
+        skipped_packages: "{{
+          apt_upgrade.stdout |
+          regex_search('(?<=kept back:\n  ).*')
+          }}"
+
+    # Generate list of skipped packages if exist.
+    - name: List Skipped Packages
+      set_fact:
+        skipped_packages: "{{ skipped_packages.split(' ') }}"
+      when: skipped_packages
+
+    # Upgrade skipped packages by specifying them directly.
+    - name: Upgrade Skipped Packages
+      apt:
+        pkg: "{{ skipped_packages }}"
+        state: latest
+      when: skipped_packages
+
+    # Generate list of all packages to be installed based on group membership.
+    # Package list can be found in `group_vars/all.yaml`.
+    - name: Select apt Packages
+      set_fact:
+        apt_pkgs: "{{ apt_pkgs + clint_packages[item] }}"
+      when: "item in clint_packages and item != 'ubuntuhost'"
+      loop: "{{ group_names }}"
+
+    - name: Install Ubuntu apt Packages
+      apt:
+        pkg: "{{ apt_pkgs }}"
+
+
+# Clone the LibreNMS agent repository for Ansible and LibreNMS hosts.
+- name: LibreNMS Agent Repository
+  hosts: ansiblehost:librenms
+  gather_facts: false
+  become: true
+
+  tasks:
+    - name: Clone LibreNMS Agent Repository
+      git:
+        repo: "https://github.com/librenms/librenms-agent.git"
+        dest: /opt/librenms-agent
+
+
+# Apache2 server configuration settings.
+- name: Apache2 Server Configuration
+  hosts: apache2
+  gather_facts: false
+  become: true
+
+  tasks:
+    # Enable applicable Apache2 modules.
+    - name: Enable Apache2 Modules
+      shell:
+        cmd: "/usr/sbin/a2enmod auth_form cgid request rewrite session session_cookie ssl socache_shmcb"
+      register: a2enmod
+      changed_when: "'Enabling module' in a2enmod.stdout"
+      failed_when: "a2enmod.stderr"
+      when: "'apache2' in group_names"
+
+    # Disable the default Apache2 server configuration.
+    - name: Disable Apache2 Default Site
+      shell:
+        cmd: "/usr/sbin/a2dissite 000-default"
+      register: a2dissite
+      changed_when: "'Site 000-default disabled' in a2dissite.stdout"
+      failed_when: "a2dissite.stderr and '000-default does not exist' not in a2dissite.stderr"
+      when: "'apache2' in group_names"
+
+
+# DNS server specific configuration settings.
+- name: BIND9 Server Configuration
+  hosts: ddidns
+  gather_facts: false
+  become: true
+
+  vars:
+    # Key file for performing DDNS updates.
+    remote_update_path: /etc/bind/remote-update.key
+
+  tasks:
+    # Ensure ownership and permissions for files that contain security related
+    # information.
+    - name: Configuration File Permissions
+      file:
+        path: "{{ item }}"
+        owner: root
+        group: bind
+        mode: u=rw,g=r,o=
+        force: true
+      loop:
+        - /etc/bind/bind.keys
+        - /etc/bind/named.conf
+        - /etc/bind/rndc.key
+
+    # Check if the DDNS update key file exists.
+    - name: Stat remote-update.key
+      stat:
+        path: "{{ remote_update_path }}"
+      register: remote_update_stat
+
+    # Set ownership and permissions to remote update key if exists.
+    - name: remote-update.key File Permissions
+      file:
+        path: "{{ remote_update_path }}"
+        owner: root
+        group: ssl-cert
+        mode: u=rw,g=r,o=
+        force: true
+      when: remote_update_stat.stat.exists
+
+
+# VRRP specific configuration settings.
+- name: keepalived Server Configuration
+  hosts: keepalived
+  gather_facts: false
+  become: true
+
+  tasks:
+    # STONITH is not used and just causes a ton of syslog messages. Disable.
+    - name: Disable STONITH
+      command: pcs property set stonith-enabled=false
+      when: "'keepalived' in group_names"
+
+    # Ensure VRRP/keepalived service is enabled.
+    - name: Enable keepalived
+      service:
+        name: keepalived
+        enabled: true
+      when: "'keepalived' in group_names"

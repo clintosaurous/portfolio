@@ -1,0 +1,43 @@
+#!/opt/clintosaurous/venv/bin/python3 -Bu
+
+"""
+This script performs a du and sorts the results by size.
+"""
+
+
+import os
+import re
+import sys
+
+
+VERSION = '2.1.2'
+LAST_UPDATE = '2022-10-21'
+
+
+if __name__ == "__main__":
+    increments = ['By', 'KB', 'MB', 'GB', 'TB', 'PB']
+
+    dir_list = sys.argv.copy()
+    del dir_list[0]
+    if not len(dir_list):
+        dir_list.append('.')
+
+    cmd = f"du -bd1 '" + "' '".join(dir_list) + "'"
+    output = os.popen(cmd).read()
+
+    values = []
+    for line in output.split('\n'):
+        line = re.sub(r'\s+', ' ', line)
+        if ' ' not in line:
+            continue
+        values.append(line.split(' ', 2))
+
+    for size, path in sorted(values, key=lambda v: int(v[0])):
+        size = int(size)
+        cur_increment = 0
+        while size > 1024:
+            size /= 1024
+            cur_increment += 1
+
+        size = f'{round(size, 2)} {increments[cur_increment]}'.rjust(11)
+        print(f'{size} {path}')

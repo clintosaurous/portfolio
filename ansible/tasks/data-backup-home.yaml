@@ -1,0 +1,17 @@
+---
+# Data Backup Ansible Helper Task Script
+#
+# Ansible helper task include script for the `data-backup.yaml` playbook for
+# generating a list of home directory files to backup. The list comes from the
+# `/etc/ansible/vars/data-backup.yaml` variable file.
+#
+# Version: 1.0.1
+# Last Update: 2023-05-09
+
+# Loop through files to add to list of files to backup. 
+- name: Add Home Paths
+  set_fact:
+    paths: "{{ paths + [home_path + '/' + item] }}"
+  loop: "{{ lhost_vars.home }}"
+  loop_control:
+    label: "{{ home_path + '/' + item }}"

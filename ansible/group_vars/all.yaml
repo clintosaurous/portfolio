@@ -8,10 +8,10 @@ mgmt_hosts:
     ip: 10.10.10.5
 
 clint_home_nets:
-  - name: Scrotum Sluts
+  - name: Server
     address: 10.10.11.0/24
     bcast: 10.10.11.255
-  - name: Basement Hoes
+  - name: LAN
     address: 10.10.10.0/24
     bcast: 10.10.10.255
 

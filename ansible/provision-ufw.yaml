@@ -1,8 +1,8 @@
 ---
 # Provision UFW Rules On Ubuntu Hosts
 #
-# Version: 1.2.1
-# Last Updated: 2023-05-09
+# Version: 1.3.0
+# Last Updated: 2023-05-10
 
 - name: Disable and Reset UFW Rules
   hosts: desktop:ubuntuhost
@@ -67,9 +67,12 @@
       ufw:
         comment: VRRP Announcements
         rule: "{{ 'allow' if 'keepalived' in group_names else 'reject' }}"
-        from_ip: 192.168.0.0/20
+        from_ip: "{{ item.address }}"
         to_ip: 224.0.0.18
         log: false
+      loop: "{{ clint_home_nets }}"
+      loop_control:
+        label: "{{ item.name }} - {{ item.address }}"
 
 
 # Allow management access from management hosts as defined in
@@ -104,9 +107,12 @@
       ufw:
         comment: DHCP
         rule: allow
-        from_ip: 192.168.0.0/20
+        from_ip: "{{ item.address }}"
         proto: udp
         to_port: "67"
+      loop: "{{ clint_home_nets }}"
+      loop_control:
+        label: "{{ item.name }} - {{ item.address }}"
 
     # Allow DHCP discovery messages.
     - name: DHCP Allow
@@ -123,9 +129,12 @@
       ufw:
         comment: DHCP Pool Peer Allow
         rule: allow
-        from_ip: 192.168.0.0/20
+        from_ip: "{{ item.address }}"
         proto: tcp
         to_port: "847"
+      loop: "{{ clint_home_nets }}"
+      loop_control:
+        label: "{{ item.name }} - {{ item.address }}"
 
 
 - name: DNS Server Firewall Rules
@@ -139,8 +148,11 @@
       ufw:
         comment: DNS
         rule: allow
-        from_ip: 192.168.0.0/20
+        from_ip: "{{ item.address }}"
         to_port: "53"
+      loop: "{{ clint_home_nets }}"
+      loop_control:
+        label: "{{ item.name }} - {{ item.address }}"
 
 
 # There are hosts that run DHCP services locally, but do not service other
@@ -178,9 +190,12 @@
       ufw:
         comment: HTTPS
         rule: allow
-        from_ip: 192.168.0.0/20
+        from_ip: "{{ item.address }}"
         proto: tcp
         to_port: "443"
+      loop: "{{ clint_home_nets }}"
+      loop_control:
+        label: "{{ item.name }} - {{ item.address }}"
 
 
 - name: MySQL Server Firewall Rules
@@ -193,9 +208,12 @@
       ufw:
         comment: MySQL
         rule: allow
-        from_ip: 192.168.0.0/20
+        from_ip: "{{ item.address }}"
         proto: tcp
         to_port: "3306"
+      loop: "{{ clint_home_nets }}"
+      loop_control:
+        label: "{{ item.name }} - {{ item.address }}"
 
 
 - name: NOC Server Firewall Rules
@@ -208,24 +226,12 @@
       ufw:
         comment: syslog
         rule: allow
-        from_ip: 192.168.0.0/20
+        from_ip: "{{ item.address }}"
         proto: udp
         to_port: "514"
-
-
-- name: Passbolt Server Firewall Rules
-  hosts: passboltsrv
-  gather_facts: false
-  become: true
-
-  tasks:
-    - name: Passbolt Allow
-      ufw:
-        comment: Passbolt
-        rule: allow
-        from_ip: 192.168.0.0/20
-        proto: tcp
-        to_port: "8443"
+      loop: "{{ clint_home_nets }}"
+      loop_control:
+        label: "{{ item.name }} - {{ item.address }}"
 
 
 - name: Plex Server Firewall Rules
@@ -238,17 +244,23 @@
       ufw:
         comment: Plex TCP
         rule: allow
-        from_ip: 192.168.0.0/20
+        from_ip: "{{ item.address }}"
         proto: tcp
         to_port: "30000:65535"
+      loop: "{{ clint_home_nets }}"
+      loop_control:
+        label: "{{ item.name }} - {{ item.address }}"
 
     - name: Plex UDP Allow
       ufw:
         comment: Plex UDP
         rule: allow
-        from_ip: 192.168.0.0/20
+        from_ip: "{{ item.address }}"
         proto: udp
         to_port: "1901,30000:65535"
+      loop: "{{ clint_home_nets }}"
+      loop_control:
+        label: "{{ item.name }} - {{ item.address }}"
 
 
 - name: VirtualBox Server Firewall Rules
@@ -298,9 +310,12 @@
         comment: "Allow Any Any"
         rule: allow
         route: true
-        from_ip: 0.0.0.0/0
+        from_ip: "{{ item.address }}"
         to_ip: 0.0.0.0/0
         log: false
+      loop: "{{ clint_home_nets }}"
+      loop_control:
+        label: "{{ item.name }} - {{ item.address }}"
 
 
 - name: Enable UFW
